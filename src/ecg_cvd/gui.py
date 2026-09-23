@@ -54,6 +54,21 @@ CLASS_NAMES = {
 }
 
 
+def environment_flag(name: str, default: bool) -> bool:
+    """Read a conservative boolean deployment setting from the environment."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def trusted_hosts() -> list[str]:
+    """Use localhost by default; deployments must explicitly opt in hosts."""
+    configured = os.getenv("ECG_TRUSTED_HOSTS", "")
+    hosts = [host.strip() for host in configured.split(",") if host.strip()]
+    return hosts or ["localhost", "127.0.0.1", "[::1]"]
+
+
 def class_name(label: str) -> str:
     return CLASS_NAMES.get(label.split(" ", 1)[-1], label)
 
@@ -102,10 +117,15 @@ def encode(data: bytes) -> str:
 
 
 def create_app(project_root: Path | str | None = None) -> Flask:
-    root = Path(project_root or Path.cwd()).resolve()
+    root = Path(project_root or os.getenv("ECG_PROJECT_ROOT") or Path.cwd()).resolve()
     app = Flask(__name__, static_folder=None)
-    app.config.update(MAX_CONTENT_LENGTH=16 * 1024 * 1024,
-                      TRUSTED_HOSTS=["localhost", "127.0.0.1", "[::1]"])
+    app.config.update(
+        MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+        TRUSTED_HOSTS=trusted_hosts(),
+        ECG_ENABLE_BACKGROUND_JOBS=environment_flag("ECG_ENABLE_BACKGROUND_JOBS", True),
+        ECG_ENABLE_TRAINING=environment_flag("ECG_ENABLE_TRAINING", True),
+        ECG_REQUIRE_MODEL_FOR_READY=environment_flag("ECG_REQUIRE_MODEL_FOR_READY", False),
+    )
     compute_lock = Lock()
     # Scrypt deliberately consumes memory; serialize password operations locally.
     password_lock = Lock()
@@ -286,6 +306,19 @@ def create_app(project_root: Path | str | None = None) -> Flask:
     def favicon():
         return "", 204
 
+    @app.get("/healthz")
+    def healthz():
+        """Cheap process-health endpoint suitable for liveness/startup probes."""
+        return jsonify(status="ok")
+
+    @app.get("/readyz")
+    def readyz():
+        """Report whether this instance has the assets required for inference."""
+        available_models = len(model_paths())
+        if app.config["ECG_REQUIRE_MODEL_FOR_READY"] and not available_models:
+            return jsonify(status="not_ready", reason="No model checkpoint is mounted."), 503
+        return jsonify(status="ready", models=available_models)
+
     @app.get("/api/state")
     def state():
         models = []
@@ -300,7 +333,10 @@ def create_app(project_root: Path | str | None = None) -> Flask:
         return jsonify(models=models, samples=samples,
                        default_model="artifacts_final/model.pt" if "artifacts_final/model.pt" in model_paths()
                        else (models[0]["id"] if models else None),
-                       dataset={"records": len(samples), "classes": len({s["label"] for s in samples})})
+                       dataset={"records": len(samples), "classes": len({s["label"] for s in samples})},
+                       capabilities={"background_jobs": app.config["ECG_ENABLE_BACKGROUND_JOBS"],
+                                     "training": (app.config["ECG_ENABLE_BACKGROUND_JOBS"]
+                                                  and app.config["ECG_ENABLE_TRAINING"])})
 
     @app.post("/api/analyze")
     def analyze():
@@ -415,6 +451,8 @@ def create_app(project_root: Path | str | None = None) -> Flask:
 
     @app.post("/api/dataset/encrypt")
     def encrypt_all_dataset():
+        if not app.config["ECG_ENABLE_BACKGROUND_JOBS"]:
+            raise ValueError("Dataset encryption jobs are disabled in this deployment. Run a Kubernetes Job instead.")
         if not sample_paths():
             raise ValueError("No MAT recordings found in MLII.")
         body = request.get_json(silent=True)
@@ -665,6 +703,8 @@ def create_app(project_root: Path | str | None = None) -> Flask:
 
     @app.post("/api/robustness")
     def robustness():
+        if not app.config["ECG_ENABLE_BACKGROUND_JOBS"]:
+            raise ValueError("Robustness jobs are disabled in this deployment. Run a Kubernetes Job instead.")
         body = request.get_json()
         if not isinstance(body, dict):
             raise ValueError("Expected a JSON configuration.")
@@ -684,6 +724,8 @@ def create_app(project_root: Path | str | None = None) -> Flask:
 
     @app.post("/api/train")
     def train():
+        if not app.config["ECG_ENABLE_BACKGROUND_JOBS"] or not app.config["ECG_ENABLE_TRAINING"]:
+            raise ValueError("Training is disabled in this deployment. Run a dedicated Kubernetes training Job instead.")
         body = request.get_json()
         if not isinstance(body, dict):
             raise ValueError("Expected a JSON configuration.")

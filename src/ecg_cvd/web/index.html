@@ -137,10 +137,10 @@
       $('analysis-status').textContent = 'Encrypted'; $('analysis-status').classList.remove('ready'); errorAt('analyze-error','');
     }
     function updateButtons() {
-      const active = workflowBusy(), hasDataset = Boolean(workspace && workspace.dataset.records), hasModel = Boolean(workspace && workspace.models.length && $('model-select').value), hasBatch = Boolean($('batch-select').value), hasRecord = Boolean(records.length && $('record-select').value);
+      const active = workflowBusy(), hasDataset = Boolean(workspace && workspace.dataset.records), hasModel = Boolean(workspace && workspace.models.length && $('model-select').value), hasBatch = Boolean($('batch-select').value), hasRecord = Boolean(records.length && $('record-select').value), backgroundJobsEnabled = !workspace || !workspace.capabilities || workspace.capabilities.background_jobs !== false, trainingEnabled = backgroundJobsEnabled && (!workspace || !workspace.capabilities || workspace.capabilities.training !== false);
       const camouflageMode = $('encryption-mode').value === 'camouflage';
-      $('batch-button').disabled = active || !hasDataset || (camouflageMode && !hasModel); $('analyze-button').disabled = active || !hasModel || !hasRecord || !hasBatch;
-      $('download-batch').disabled = active || !hasBatch; $('robustness-button').disabled = active || !hasDataset || !hasModel; $('training-button').disabled = active || !hasDataset;
+      $('batch-button').disabled = active || !backgroundJobsEnabled || !hasDataset || (camouflageMode && !hasModel); $('analyze-button').disabled = active || !hasModel || !hasRecord || !hasBatch;
+      $('download-batch').disabled = active || !hasBatch; $('robustness-button').disabled = active || !backgroundJobsEnabled || !hasDataset || !hasModel; $('training-button').disabled = active || !trainingEnabled || !hasDataset;
       $('batch-select').disabled = active || !catalog.batches.length; $('record-select').disabled = active || !records.length; $('model-select').disabled = active || !hasModel;
       ['analysis-password','include-attack','epsilon','train-epochs','train-batch','train-epsilon','hide-results','download-image','download-report','download-attack-image','download-robustness','encryption-mode','download-restored-mat'].forEach(id => { $(id).disabled = active; });
       $('download-camouflaged').disabled = active || !publicCamouflage; $('download-public-result').disabled = active || !publicCamouflage; $('camouflage-epsilon').disabled = active || !camouflageMode; $('camouflage-steps').disabled = active || !camouflageMode;

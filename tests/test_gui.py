@@ -73,7 +73,7 @@ class GUIAPITests(unittest.TestCase):
         response = self.client.get("/api/state")
         self.assertEqual(response.status_code, 200)
         state = response.get_json()
-        self.assertEqual(set(state), {"models", "samples", "default_model", "dataset"})
+        self.assertEqual(set(state), {"models", "samples", "default_model", "dataset", "capabilities"})
         self.assertEqual(state["dataset"], {"classes": 1, "records": 1})
         self.assertEqual(state["default_model"], self.model_id)
         self.assertEqual([item["id"] for item in state["models"]], [self.model_id])

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecg-workbench
+  labels:
+    app.kubernetes.io/name: ecg-workbench
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ecg-workbench
+  ports:
+    - name: http
+      port: 8765
+      targetPort: http
+      protocol: TCP

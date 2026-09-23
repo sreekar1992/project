@@ -1,0 +1,67 @@
+# This Job retrains the existing RAMNV2 baseline. It is not a pretrained-model
+# fine-tuning job; see k8s/README.md before using its metrics in a paper.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ecg-retrain-baseline
+  namespace: ecg-research
+  labels:
+    app.kubernetes.io/name: ecg-workbench
+    app.kubernetes.io/component: training
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: train
+          image: ecg-workbench:dev
+          imagePullPolicy: IfNotPresent
+          command: ["ecg-train"]
+          args:
+            - --data
+            - /data/MLII
+            - --epochs
+            - "30"
+            - --batch-size
+            - "32"
+            - --lr
+            - "0.0001"
+            - --device
+            - cuda
+            - --artifacts
+            - /data/artifacts_k8s/retrain-baseline
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: project-data
+              mountPath: /data
+            - name: temporary-files
+              mountPath: /tmp
+      volumes:
+        - name: project-data
+          persistentVolumeClaim:
+            claimName: ecg-workbench-data
+        - name: temporary-files
+          emptyDir:
+            sizeLimit: 1Gi
