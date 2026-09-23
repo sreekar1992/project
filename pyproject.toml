@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecg-cvd-xai"
+version = "0.1.0"
+description = "Research baseline for ECG arrhythmia classification on Mendeley 7dybx7wyfn"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26", "scipy>=1.11", "scikit-learn>=1.3", "torch>=2.2",
+  "matplotlib>=3.8", "requests>=2.31", "tqdm>=4.66", "cryptography>=43.0", "flask>=3.1,<4"
+]
+
+[project.scripts]
+ecg-train = "ecg_cvd.train:main"
+ecg-predict = "ecg_cvd.predict:main"
+ecg-encrypt = "ecg_cvd.crypto:encrypt_main"
+ecg-decrypt = "ecg_cvd.crypto:decrypt_main"
+ecg-robustness = "ecg_cvd.robustness:main"
+ecg-gui = "ecg_cvd.gui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ecg_cvd = ["web/*.html"]

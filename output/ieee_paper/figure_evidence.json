@@ -1,0 +1,177 @@
+{
+  "figures": [
+    "fig01_workflow",
+    "fig02_confusion_matrix",
+    "fig03_fgsm_curve",
+    "fig04_camouflage_recovery"
+  ],
+  "width_inches": 3.45,
+  "png_dpi": 400,
+  "font_size_pt": 8,
+  "confusion_matrix": {
+    "source": "output/paper_results/tables/confusion_matrix_counts.csv",
+    "class_order": [
+      "1 NSR",
+      "2 APB",
+      "3 AFL",
+      "4 AFIB",
+      "5 SVTA",
+      "6 WPW",
+      "7 PVC",
+      "8 Bigeminy",
+      "9 Trigeminy",
+      "10 VT",
+      "11 IVR",
+      "12 VFL",
+      "13 Fusion",
+      "14 LBBBB",
+      "15 RBBBB",
+      "16 SDHB",
+      "17 PR"
+    ],
+    "n": 200,
+    "correct": 174,
+    "zero_cells": "left blank",
+    "cell_values": "fragment counts"
+  },
+  "fgsm_saved_results": [
+    {
+      "epsilon": 0,
+      "accuracy": 0.87,
+      "macro_f1": 0.7608849980833366,
+      "correct": 174,
+      "n": 200,
+      "max_absolute_perturbation": 0
+    },
+    {
+      "epsilon": 0.01,
+      "accuracy": 0.835,
+      "macro_f1": 0.714976385438911,
+      "correct": 167,
+      "n": 200,
+      "max_absolute_perturbation": 0.010000228881835938
+    },
+    {
+      "epsilon": 0.02,
+      "accuracy": 0.77,
+      "macro_f1": 0.6507062794389114,
+      "correct": 154,
+      "n": 200,
+      "max_absolute_perturbation": 0.020000457763671875
+    },
+    {
+      "epsilon": 0.05,
+      "accuracy": 0.595,
+      "macro_f1": 0.49459971159002053,
+      "correct": 119,
+      "n": 200,
+      "max_absolute_perturbation": 0.05000019073486328
+    },
+    {
+      "epsilon": 0.1,
+      "accuracy": 0.35,
+      "macro_f1": 0.35628784858990464,
+      "correct": 70,
+      "n": 200,
+      "max_absolute_perturbation": 0.10000038146972656
+    },
+    {
+      "epsilon": 0.2,
+      "accuracy": 0.14,
+      "macro_f1": 0.10735810824144265,
+      "correct": 28,
+      "n": 200,
+      "max_absolute_perturbation": 0.20000076293945312
+    }
+  ],
+  "example": {
+    "source": "MLII/1 NSR/100m (2).mat",
+    "split_membership": "training",
+    "example_selection": "User's existing illustrative example; a training fragment, not a held-out robustness estimate.",
+    "batch_id": "f5af518e8dc04ebb9bd4504b31c8f052",
+    "record_id": "797baf3e6aff4bcfa1a05c8975a8c8c8",
+    "checkpoint_sha256": "f2ea83714317c0b98cc36f314775e0c69001f810b6ed0d860429b756a71daa35",
+    "predictions_recomputed_cpu": {
+      "original": {
+        "label": "1 NSR",
+        "score": 0.9975093603134155
+      },
+      "public_decoy": {
+        "label": "2 APB",
+        "score": 0.9463513493537903
+      },
+      "restored": {
+        "label": "1 NSR",
+        "score": 0.9975093603134155
+      }
+    },
+    "authenticated_creation_report": {
+      "attack_reference_label": "1 NSR",
+      "attack_reference_source": "clean prediction",
+      "attack_success": true,
+      "camouflaged_correct": false,
+      "camouflaged_prediction": {
+        "confidence": 0.9463513493537903,
+        "label": "2 APB",
+        "top_predictions": [
+          {
+            "label": "2 APB",
+            "probability": 0.9463513493537903
+          },
+          {
+            "label": "5 SVTA",
+            "probability": 0.030212033540010452
+          },
+          {
+            "label": "1 NSR",
+            "probability": 0.013560459017753601
+          }
+        ]
+      },
+      "clean_correct": true,
+      "clean_prediction": {
+        "confidence": 0.9975093603134155,
+        "label": "1 NSR",
+        "top_predictions": [
+          {
+            "label": "1 NSR",
+            "probability": 0.9975093603134155
+          },
+          {
+            "label": "2 APB",
+            "probability": 0.0019222113769501448
+          },
+          {
+            "label": "5 SVTA",
+            "probability": 0.00033914923551492393
+          }
+        ]
+      },
+      "epsilon": 0.5,
+      "label_changed": true,
+      "max_absolute_raw_change": 1.77099609375,
+      "method": "iterative gradient-guided raw waveform camouflage",
+      "model": "artifacts_final/model.pt",
+      "model_input_max_change": 0.21948349475860596,
+      "model_sha256": "f2ea83714317c0b98cc36f314775e0c69001f810b6ed0d860429b756a71daa35",
+      "mse": 2.3714874279499054,
+      "note": "Research-only adversarial camouflage, not encryption or a new diagnosis. The raw waveform is changed within a measured amplitude budget and every prediction is recomputed through the real ECG preprocessing pipeline. A label change is not guaranteed and does not establish privacy or protection against attacks or other models. This heuristic is not exact raw-space PGD or the full RNAF/PPO framework. Scores are uncalibrated model outputs. Original recovery must use an authenticated encrypted copy of the original; the camouflage transform itself is not reversibly decryptable.",
+      "raw_budget": 8.855176749838861,
+      "raw_budget_unit": "original MAT amplitude units",
+      "reference_filtered_mad_scale": 17.710353499677723,
+      "steps_requested": 20,
+      "steps_used": 2
+    },
+    "original_sha256": "75fe982880ba4d4aa9af22eba7d6592f4f4b97d33ff82ebb7e3b98a7cc34e322",
+    "restored_sha256": "75fe982880ba4d4aa9af22eba7d6592f4f4b97d33ff82ebb7e3b98a7cc34e322",
+    "bytes_identical": true,
+    "raw_waveform_identical": true,
+    "restoration_mse": 0.0,
+    "restoration_max_absolute_error": 0.0,
+    "camouflage_mse": 2.3714874279499054,
+    "camouflage_max_absolute_change": 1.77099609375,
+    "units": "raw dataset amplitude units; no millivolt calibration assumed",
+    "score_note": "Softmax model scores are uncalibrated; not disease probabilities.",
+    "security_note": "The public altered signal is readable and is not confidential encryption or demonstrated attack prevention."
+  }
+}
