@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecg-platform-api
+  namespace: ecg-clinical-research
+  labels:
+    app.kubernetes.io/name: ecg-platform-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ecg-platform-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

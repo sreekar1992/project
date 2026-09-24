@@ -1,4 +1,91 @@
-# ECG Workbench
+# ECG Workbench and Health-Platform Foundation
+
+## ECG health platform (new, research/CDS only)
+
+The repository now includes a separate authenticated, multi-hospital ECG
+health-platform foundation alongside the original local research workbench.
+It preserves the real `src/ecg_cvd` inference pipeline and records its output
+as **AI-generated research/clinical-decision-support material requiring
+qualified clinician review**. It does not turn a model result into a diagnosis,
+treatment recommendation, prescription, or claim of clinical validation.
+
+The new platform provides a Flask REST API, PostgreSQL/SQLAlchemy/Alembic
+deployment path, tenant-scoped RBAC, EMPI/MRN patient registration, encounters,
+private ECG assets, actual model inference/Grad-CAM, clinician-authored reviews,
+PDF reports with the authorized waveform, FHIR-compatible read mappings, audit
+events, an RQ worker, and a React client with an interactive authorized waveform
+viewer. The legacy one-page workbench and its public demonstration
+encryption password remain separate and must not be used for patient records.
+
+Read the actual preserved model contract first: [existing ECG AI interface](docs/existing-ecg-ai-interface.md).
+The platform documentation starts at [development](docs/development.md) and
+[architecture](docs/architecture.md).
+
+### Run the platform locally
+
+Use a development database and private local asset directory; PostgreSQL,
+MinIO, and Redis are not required for this first local smoke test.
+
+```bash
+cd /Users/sreekarvarma/Documents/project
+source .venv/bin/activate
+export AI_MODEL_PATH="$PWD/artifacts_final/model.pt"
+export AI_MODEL_VERSION="local-research-checkpoint"
+ecg-health-api --project "$PWD"
+```
+
+In a second terminal, run the React client:
+
+```bash
+cd /Users/sreekarvarma/Documents/project/frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. To create clearly fake development users, choose
+your own non-production password and run:
+
+```bash
+ecg-health-seed --project /Users/sreekarvarma/Documents/project --password 'your-development-only-password'
+```
+
+The seed command never prints or commits that password. It creates only
+`example.test` accounts and clearly fake data.
+
+### Run the Compose development stack
+
+```bash
+cp .env.example .env
+# Replace every placeholder in .env with unique local-development secrets.
+docker compose up --build -d
+docker compose exec -e ECG_PLATFORM_ENV=development backend \
+  ecg-health-seed --password 'your-development-only-password'
+```
+
+The Compose migration service runs `ecg-health-migrate` before the API and
+worker start; it applies Alembic revisions and creates only role, permission,
+and feature reference rows—never users, hospitals, or patient data. Do not
+bypass it or rely on automatic schema creation. The stack
+mounts `./artifacts_final/model.pt` read-only. Do not add
+MLII, actual clinical recordings, keys, or populated `.env` files to the image
+or Git repository. The platform frontend is at `http://localhost:5173` and the
+private backend API is at `http://localhost:8080`.
+
+### Platform verification
+
+```bash
+MPLCONFIGDIR=/private/tmp/ecg-platform-mpl .venv/bin/python -m unittest tests.test_clinical_platform -v
+cd frontend && npm run build
+```
+
+The platform test creates a temporary checkpoint and temporary fake clinical
+records. It verifies a real adapter path from MAT upload through inference,
+Grad-CAM, clinician review, report PDF, FHIR mapping, RBAC, and cross-hospital
+isolation.
+
+---
+
+## Legacy ECG Workbench
 
 A single-page local interface for your ECG research project. The default **camouflage + AES recovery** mode creates altered MAT waveforms intended to change the selected classifier's prediction, while storing an authenticated encrypted copy of the exact original inside each camouflaged MAT. Enter the fixed demonstration password `987654321` to recover the original and compare original, altered, and recovered predictions. AES-only encryption, adversarial stress tests, and model training remain available separately.
 

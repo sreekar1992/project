@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ecg-platform-api-ingress
+  namespace: ecg-clinical-research
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ecg-platform-api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080

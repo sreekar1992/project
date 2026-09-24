@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecg-platform-config
+  namespace: ecg-clinical-research
+data:
+  ECG_PLATFORM_ENV: production
+  OBJECT_STORAGE_BACKEND: s3
+  OBJECT_STORAGE_ENDPOINT: https://replace-with-private-object-storage.example
+  OBJECT_STORAGE_BUCKET: replace-with-private-bucket
+  OBJECT_STORAGE_REGION: us-east-1
+  ALLOW_OBJECT_STORAGE_BUCKET_CREATE: "false"
+  REDIS_URL: redis://replace-with-private-redis:6379/0
+  ASYNC_ANALYSIS: "true"
+  AI_MODEL_PATH: /models/model.pt
+  AI_MODEL_VERSION: replace-with-registered-model-version
+  CORS_ORIGINS: https://replace-with-approved-web-origin.example
+  ECG_PLATFORM_TRUSTED_HOSTS: localhost,ecg-platform-api,replace-with-approved-api-host.example
+  MPLCONFIGDIR: /tmp/matplotlib

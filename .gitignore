@@ -5,6 +5,10 @@ __pycache__/
 .DS_Store
 .cache/
 tmp/
+.env
+var/
+frontend/node_modules/
+frontend/dist/
 *.key
 oci-image-keys/
 MLII/
