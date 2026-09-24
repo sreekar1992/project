@@ -15,12 +15,16 @@ dependencies = [
   "flask-limiter>=3.10,<5", "gunicorn>=23,<24", "psycopg[binary]>=3.2,<4"
 ]
 
+[project.optional-dependencies]
+export = ["onnx>=1.16,<2", "onnxscript>=0.2,<1"]
+
 [project.scripts]
 ecg-train = "ecg_cvd.train:main"
 ecg-predict = "ecg_cvd.predict:main"
 ecg-encrypt = "ecg_cvd.crypto:encrypt_main"
 ecg-decrypt = "ecg_cvd.crypto:decrypt_main"
 ecg-robustness = "ecg_cvd.robustness:main"
+ecg-export-model = "ecg_cvd.export_model:main"
 ecg-gui = "ecg_cvd.gui:main"
 ecg-health-api = "ecg_cvd.clinical.app:main"
 ecg-health-seed = "ecg_cvd.clinical.seed:main"

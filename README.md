@@ -1,5 +1,13 @@
 # ECG Workbench and Health-Platform Foundation
 
+For the complete macOS and Windows setup, model training/export/import, local
+platform, Docker Compose, Kubernetes-boundary, verification, and troubleshooting
+guide, read [Cross-platform AI model export, import, and operations](docs/model-export-cross-platform.md).
+
+Cloud-specific deployment runbooks are separate because the current Kubernetes
+files are only scaffolding: [AWS deployment](docs/aws-deployment.md) and
+[Azure deployment](docs/azure-deployment.md).
+
 ## ECG health platform (new, research/CDS only)
 
 The repository now includes a separate authenticated, multi-hospital ECG
