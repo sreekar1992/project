@@ -135,6 +135,7 @@ resource "google_sql_database_instance" "main" {
   deletion_protection = true
   settings {
     tier              = var.database_tier
+    edition           = "ENTERPRISE"
     availability_type = "ZONAL"
     backup_configuration {
       enabled                        = true
