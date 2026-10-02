@@ -13,6 +13,8 @@ restored/
 output/
 *.key
 *.zip
+gha-creds-*.json
+gha-kubeconfig-*
 oci-image-keys/
 tests/
 scripts/

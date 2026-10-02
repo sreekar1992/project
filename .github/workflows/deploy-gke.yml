@@ -1,0 +1,108 @@
+name: Deploy clinical platform to GKE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: gke-clinical-research
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: gke-research
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GAR_LOCATION: ${{ vars.GAR_LOCATION }}
+      GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+      GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+      GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+      WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      DEPLOY_SA: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      OBJECT_STORAGE_BUCKET: ${{ vars.OBJECT_STORAGE_BUCKET }}
+      GCP_WORKLOAD_SERVICE_ACCOUNT: ${{ vars.GCP_WORKLOAD_SERVICE_ACCOUNT }}
+      AI_MODEL_VERSION: ${{ vars.AI_MODEL_VERSION }}
+      CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+      ECG_PLATFORM_TRUSTED_HOSTS: ${{ vars.ECG_PLATFORM_TRUSTED_HOSTS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check deployment configuration
+        run: |
+          set -euo pipefail
+          for name in PROJECT_ID GAR_LOCATION GAR_REPOSITORY GKE_CLUSTER GKE_LOCATION WIF_PROVIDER DEPLOY_SA OBJECT_STORAGE_BUCKET GCP_WORKLOAD_SERVICE_ACCOUNT AI_MODEL_VERSION CORS_ORIGINS ECG_PLATFORM_TRUSTED_HOSTS; do
+            if [ -z "${!name:-}" ]; then echo "Missing GitHub environment variable: $name" >&2; exit 1; fi
+          done
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Artifact Registry
+        run: gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and publish images
+        run: |
+          set -euo pipefail
+          registry="${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}"
+          docker buildx build --platform linux/amd64 --push --metadata-file /tmp/ecg-api-image.json \
+            -f Dockerfile.platform -t "${registry}/ecg-platform-api:${GITHUB_SHA}" .
+          docker buildx build --platform linux/amd64 --push --metadata-file /tmp/ecg-frontend-image.json \
+            -f frontend/Dockerfile.gke -t "${registry}/ecg-platform-frontend:${GITHUB_SHA}" frontend
+          api_digest="$(python3 -c 'import json; print(json.load(open("/tmp/ecg-api-image.json"))["containerimage.digest"])')"
+          frontend_digest="$(python3 -c 'import json; print(json.load(open("/tmp/ecg-frontend-image.json"))["containerimage.digest"])')"
+          echo "API_IMAGE=${registry}/ecg-platform-api@${api_digest}" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=${registry}/ecg-platform-frontend@${frontend_digest}" >> "$GITHUB_ENV"
+          echo "RELEASE_ID=${GITHUB_SHA:0:7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER }}
+          location: ${{ env.GKE_LOCATION }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Check cluster prerequisites
+        run: |
+          set -euo pipefail
+          kubectl apply -f k8s/platform/namespace.yaml
+          kubectl -n ecg-clinical-research get secret ecg-platform-secrets >/dev/null
+          for key in DATABASE_URL SECRET_KEY JWT_SECRET REDIS_URL; do
+            value="$(kubectl -n ecg-clinical-research get secret ecg-platform-secrets -o "jsonpath={.data.${key}}")"
+            if [ -z "$value" ]; then echo "Missing ecg-platform-secrets key: $key" >&2; exit 1; fi
+          done
+
+      - name: Render release
+        run: |
+          python3 -m venv /tmp/ecg-render-venv
+          /tmp/ecg-render-venv/bin/python -m pip install --disable-pip-version-check 'PyYAML>=6,<7'
+          /tmp/ecg-render-venv/bin/python scripts/render_gke.py
+
+      - name: Configure workload identity
+        run: kubectl apply -f /tmp/ecg-gke-release/service-account.yaml
+
+      - name: Migrate database
+        run: |
+          set -euo pipefail
+          kubectl apply -f /tmp/ecg-gke-release/config.yaml
+          kubectl apply -f /tmp/ecg-gke-release/migration.yaml
+          kubectl -n ecg-clinical-research wait --for=condition=complete \
+            "job/ecg-platform-migrate-${RELEASE_ID}" --timeout=300s
+
+      - name: Deploy and verify rollout
+        run: |
+          set -euo pipefail
+          kubectl apply -f /tmp/ecg-gke-release/deployment.yaml
+          kubectl -n ecg-clinical-research rollout status deployment/ecg-platform-api --timeout=300s
+          kubectl -n ecg-clinical-research rollout status deployment/ecg-platform-worker --timeout=300s
+          kubectl -n ecg-clinical-research rollout status deployment/ecg-platform-frontend --timeout=300s
+          kubectl -n ecg-clinical-research get service ecg-platform-frontend

@@ -1,0 +1,13 @@
+output "project_id" { value = var.project_id }
+output "cluster_name" { value = google_container_cluster.main.name }
+output "cluster_location" { value = google_container_cluster.main.location }
+output "artifact_registry_location" { value = google_artifact_registry_repository.images.location }
+output "artifact_registry_repository" { value = google_artifact_registry_repository.images.repository_id }
+output "github_workload_identity_provider" { value = google_iam_workload_identity_pool_provider.github.name }
+output "github_deploy_service_account" { value = google_service_account.deploy.email }
+output "workload_service_account" { value = google_service_account.workload.email }
+output "database_private_ip" { value = google_sql_database_instance.main.private_ip_address }
+output "database_password_secret" { value = google_secret_manager_secret.database_password.secret_id }
+output "redis_host" { value = google_redis_instance.main.host }
+output "asset_bucket" { value = google_storage_bucket.assets.name }
+output "model_object" { value = google_storage_bucket_object.model.name }

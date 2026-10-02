@@ -236,7 +236,52 @@ class S3PrivateStorage:
         )
 
 
+class GCSPrivateStorage:
+    """Private GCS storage using the pod's Workload Identity credentials."""
+
+    def __init__(self, settings: Settings):
+        if not settings.object_storage_bucket:
+            raise RuntimeError("GCS storage requires OBJECT_STORAGE_BUCKET.")
+        from google.cloud import storage
+        self.bucket_name = settings.object_storage_bucket
+        self.bucket = storage.Client().bucket(self.bucket_name)
+
+    def put_bytes(self, key: str, data: bytes, content_type: str) -> StoredObject:
+        _validate_key(key)
+        from google.api_core.exceptions import PreconditionFailed
+        blob = self.bucket.blob(key)
+        try:
+            blob.upload_from_string(data, content_type=content_type, if_generation_match=0)
+        except PreconditionFailed as exc:
+            raise ValueError("Refusing to overwrite an immutable stored clinical asset.") from exc
+        return StoredObject(uri=f"gs://{self.bucket_name}/{key}", object_key=key,
+                            sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data),
+                            content_type=content_type)
+
+    def get_bytes(self, object_key: str) -> bytes:
+        _validate_key(object_key)
+        return self.bucket.blob(object_key).download_as_bytes()
+
+    def presigned_get(self, object_key: str, expires_seconds: int = 300) -> str | None:
+        _validate_key(object_key)
+        # The app streams downloads after its own authorization checks.
+        return None
+
+    def protection_status(self, object_key: str) -> AssetProtection:
+        _validate_key(object_key)
+        if not self.bucket.blob(object_key).exists():
+            raise FileNotFoundError("Private clinical asset is unavailable.")
+        return AssetProtection(
+            encrypted_at_rest=True,
+            algorithm="Google Cloud Storage server-side encryption",
+            authenticated_encryption=False,
+            key_management="Google Cloud managed encryption keys.",
+        )
+
+
 def build_storage(settings: Settings) -> ObjectStorage:
     if settings.object_storage_backend == "s3":
         return S3PrivateStorage(settings)
+    if settings.object_storage_backend == "gcs":
+        return GCSPrivateStorage(settings)
     return LocalPrivateStorage(settings.local_object_storage_path, settings.local_asset_encryption_key_path)

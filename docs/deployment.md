@@ -44,6 +44,8 @@ Neither endpoint validates clinical accuracy, database migration state, object-s
 
 ## Kubernetes deployment scaffolding
 
+For the GKE and GitHub Actions release workflow, see [gke-deployment.md](gke-deployment.md).
+
 `k8s/platform/` provides Kubernetes manifests for the platform API and RQ worker, plus ConfigMap and Secret templates, a Service, NetworkPolicy, and Kustomize entry point. They have not been applied to a cluster or validated as a production deployment. They deliberately require an external frontend/Ingress, migration release job using `ecg-health-migrate`, model PVC, private PostgreSQL/Redis/object storage, and populated Secret. The older private ECG workbench remains separately packaged under `k8s/base`.
 
 A deployment must separately operate stateless frontend, API, and RQ worker workloads from stateful services. Use a managed or separately operated PostgreSQL service, private S3-compatible storage, Redis, a secret manager, TLS ingress, restrictive ingress and egress network policies, immutable model artifacts, and a non-root/read-only container configuration. Keep database backups, storage lifecycle, access logs, monitoring, and migration jobs outside the application image.

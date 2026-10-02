@@ -68,8 +68,8 @@ class Settings:
             flask_secret = flask_secret or secrets.token_urlsafe(48)
         storage_backend = str(overrides.get("OBJECT_STORAGE_BACKEND")
                               or os.getenv("OBJECT_STORAGE_BACKEND", "local")).lower()
-        if storage_backend not in {"local", "s3"}:
-            raise RuntimeError("OBJECT_STORAGE_BACKEND must be 'local' or 's3'.")
+        if storage_backend not in {"local", "s3", "gcs"}:
+            raise RuntimeError("OBJECT_STORAGE_BACKEND must be 'local', 's3', or 'gcs'.")
         model = overrides.get("AI_MODEL_PATH", os.getenv("AI_MODEL_PATH"))
         # Vite is commonly opened through either loopback hostname during local
         # development.  Both are explicit, same-machine origins; deployed

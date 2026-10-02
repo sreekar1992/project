@@ -10,9 +10,17 @@ var/
 frontend/node_modules/
 frontend/dist/
 *.key
+gha-creds-*.json
+gha-kubeconfig-*
 oci-image-keys/
 MLII/
 *.zip
 artifacts*/
 secure/
 restored/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+crash.log
