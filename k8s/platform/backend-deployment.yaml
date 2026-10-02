@@ -54,20 +54,26 @@ spec:
               drop: ["ALL"]
           startupProbe:
             httpGet:
-              host: localhost
+              httpHeaders:
+                - name: Host
+                  value: ecg-platform-api
               path: /healthz
               port: http
             failureThreshold: 30
             periodSeconds: 5
           livenessProbe:
             httpGet:
-              host: localhost
+              httpHeaders:
+                - name: Host
+                  value: ecg-platform-api
               path: /healthz
               port: http
             periodSeconds: 15
           readinessProbe:
             httpGet:
-              host: localhost
+              httpHeaders:
+                - name: Host
+                  value: ecg-platform-api
               path: /readyz
               port: http
             periodSeconds: 10
