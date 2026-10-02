@@ -12,7 +12,7 @@ locals {
     "storage.googleapis.com",
     "sts.googleapis.com",
   ])
-  namespace = "ecg-clinical-research"
+  namespace    = "ecg-clinical-research"
   workload_ksa = "ecg-platform"
 }
 
@@ -166,7 +166,9 @@ resource "google_sql_user" "app" {
 
 resource "google_secret_manager_secret" "database_password" {
   secret_id = "${var.name_prefix}-database-password"
-  replication { auto {} }
+  replication {
+    auto {}
+  }
   depends_on = [google_project_service.required]
 }
 

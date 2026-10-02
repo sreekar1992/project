@@ -1,0 +1,10 @@
+<component name="libraryTable">
+  <library name="output">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/output/ecg_encrypted_dataset.zip!/" />
+      <root url="jar://$PROJECT_DIR$/output/ecg_paper_results.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

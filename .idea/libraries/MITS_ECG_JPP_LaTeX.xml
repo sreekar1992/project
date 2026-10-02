@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="MITS_ECG_JPP_LaTeX">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/output/latex_mits/MITS_ECG_JPP_LaTeX.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>
