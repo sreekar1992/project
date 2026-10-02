@@ -356,6 +356,11 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
     def waveform_data(ecg_id: str):
         return jsonify(ClinicalService(current_principal()).waveform_data(ecg_id))
 
+    @api.get("/ecgs/<ecg_id>/security")
+    @require_any_permission("ecg.read", "ecg.self.read")
+    def ecg_security(ecg_id: str):
+        return jsonify(ClinicalService(current_principal()).ecg_security(ecg_id))
+
     @api.get("/ecgs/<ecg_id>/download-url")
     @require_any_permission("ecg.read", "ecg.self.read")
     def ecg_download_url(ecg_id: str):

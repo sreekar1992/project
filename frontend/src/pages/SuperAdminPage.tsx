@@ -291,18 +291,18 @@ export function SuperAdminPage() {
 
   return (
     <Stack spacing={3}>
-      <Box>
+      <Paper sx={{ position: "relative", overflow: "hidden", p: { xs: 3, md: 4 }, color: "common.white", backgroundColor: "#075d86", backgroundImage: "linear-gradient(108deg, rgba(4, 48, 82, 0.95), rgba(4, 118, 142, 0.7) 56%, rgba(10, 57, 159, 0.7)), url('/assets/ecg-hero-background.png')", backgroundSize: "cover", backgroundPosition: "center" }}>
         <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" alignItems={{ md: "flex-start" }} gap={2}>
           <Box>
-            <Typography variant="overline" color="primary.main" sx={{ fontWeight: 800, letterSpacing: 1.6 }}>Platform governance · Super Administrator</Typography>
-            <Typography variant="h4">Research platform administration</Typography>
-            <Typography color="text.secondary" sx={{ mt: 0.75, maxWidth: 900 }}>
+            <Typography variant="overline" sx={{ color: "#99faf2" }}>Platform governance · Super Administrator</Typography>
+            <Typography variant="h3">Research platform administration</Typography>
+            <Typography sx={{ mt: 1, maxWidth: 900, color: "rgba(242, 253, 255, 0.9)" }}>
               Global operational records are loaded from the authorized API. This workspace administers platform configuration only; it does not diagnose patients, determine treatment, or replace clinical governance.
             </Typography>
           </Box>
-          <Button variant="outlined" startIcon={<RefreshOutlinedIcon />} onClick={refreshAll}>Refresh authorized data</Button>
+          <Button variant="outlined" color="inherit" startIcon={<RefreshOutlinedIcon />} onClick={refreshAll} sx={{ borderColor: "rgba(255,255,255,0.56)", "&:hover": { borderColor: "common.white", bgcolor: "rgba(255,255,255,0.12)" } }}>Refresh authorized data</Button>
         </Stack>
-      </Box>
+      </Paper>
 
       <Alert severity="warning" icon={<SecurityOutlinedIcon fontSize="inherit" />}>
         Feature `enabled` values and hospital `DISABLED` statuses are currently recorded configuration data. The backend does not yet use them as access revocation, route enforcement, or a clinical safety boundary.

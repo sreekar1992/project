@@ -11,7 +11,7 @@ pip install -e .
 AI_MODEL_PATH="$PWD/artifacts_final/model.pt" ecg-health-api --project "$PWD"
 ```
 
-Without `DATABASE_URL`, development uses SQLite at `var/ecg_health.db`; without `OBJECT_STORAGE_BACKEND`, it uses private local files under `var/clinical_objects`. These are local-development defaults, not a shared or encrypted clinical deployment. Use `ecg-health-seed --project "$PWD"` only to create clearly fake development accounts and provide a new password interactively.
+Without `DATABASE_URL`, development uses SQLite at `var/ecg_health.db`; without `OBJECT_STORAGE_BACKEND`, it uses private local files under `var/clinical_objects`. Newly uploaded local clinical assets are wrapped with AES-256-GCM and a local `0600` key at `var/clinical_asset_key.bin` by default; set `LOCAL_ASSET_ENCRYPTION_KEY_PATH` only to move that development key to an approved private path. Existing local assets are deliberately treated as legacy until they are re-uploaded or migrated. These are still local-development defaults—not a shared, KMS/HSM-backed, clinically validated deployment. Use `ecg-health-seed --project "$PWD"` only to create clearly fake development accounts and provide a new password interactively.
 
 The frontend is a separate Vite client:
 

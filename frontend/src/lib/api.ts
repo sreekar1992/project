@@ -6,6 +6,7 @@ import type {
   ClinicalReview,
   DashboardResponse,
   EcgRecord,
+  EcgSecurityStatus,
   EcgWaveform,
   Encounter,
   PaginatedResponse,
@@ -16,6 +17,7 @@ import type {
 const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
 export const API_BASE_URL = (configuredBaseUrl || "/api/v1").replace(/\/$/, "");
 const ACCESS_TOKEN_KEY = "ecg-research-platform.access-token";
+const EXPLICIT_SIGN_OUT_KEY = "ecg-research-platform.signed-out";
 
 export class ApiError extends Error {
   constructor(
@@ -28,15 +30,28 @@ export class ApiError extends Error {
   }
 }
 
+let authGeneration = 0;
+
 export const authStorage = {
   getAccessToken(): string | null {
     return window.sessionStorage.getItem(ACCESS_TOKEN_KEY);
   },
   setAccessToken(token: string): void {
+    authGeneration += 1;
+    window.sessionStorage.removeItem(EXPLICIT_SIGN_OUT_KEY);
     window.sessionStorage.setItem(ACCESS_TOKEN_KEY, token);
   },
   clear(): void {
+    authGeneration += 1;
     window.sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+  },
+  markSignedOut(): void {
+    authGeneration += 1;
+    window.sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+    window.sessionStorage.setItem(EXPLICIT_SIGN_OUT_KEY, "true");
+  },
+  wasExplicitlySignedOut(): boolean {
+    return window.sessionStorage.getItem(EXPLICIT_SIGN_OUT_KEY) === "true";
   },
 };
 
@@ -80,24 +95,39 @@ function messageFromPayload(payload: unknown, fallback: string): string {
 
 let refreshInFlight: Promise<string | null> | null = null;
 
+function canRefreshAfterUnauthorized(path: string): boolean {
+  return path !== "/auth/login" && path !== "/auth/refresh" && path !== "/auth/logout";
+}
+
 async function refreshAccessToken(): Promise<string | null> {
   if (refreshInFlight) {
     return refreshInFlight;
   }
 
   refreshInFlight = (async () => {
-    const response = await fetch(endpoint("/auth/refresh"), {
-      method: "POST",
-      credentials: "include",
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await parsePayload(response)) as AuthTokens;
-    const token = response.ok ? tokenFrom(payload) : undefined;
-    if (token) {
-      authStorage.setAccessToken(token);
-      return token;
+    if (authStorage.wasExplicitlySignedOut()) {
+      return null;
     }
-    authStorage.clear();
+    const generationAtStart = authGeneration;
+    try {
+      const response = await fetch(endpoint("/auth/refresh"), {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json" },
+      });
+      const payload = (await parsePayload(response)) as AuthTokens;
+      const token = response.ok ? tokenFrom(payload) : undefined;
+      if (token && generationAtStart === authGeneration) {
+        authStorage.setAccessToken(token);
+        return token;
+      }
+    } catch {
+      // A missing/expired cookie or an unavailable local server is handled as
+      // an unauthenticated state, not exposed as a raw bearer-token error.
+    }
+    if (generationAtStart === authGeneration) {
+      authStorage.clear();
+    }
     return null;
   })().finally(() => {
     refreshInFlight = null;
@@ -111,6 +141,27 @@ interface RequestOptions extends Omit<RequestInit, "body"> {
   retryAfterRefresh?: boolean;
 }
 
+async function authorizedFetch(path: string, init: RequestInit, retryAfterRefresh = true): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const token = authStorage.getAccessToken();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const response = await fetch(endpoint(path), {
+    ...init,
+    credentials: "include",
+    headers,
+  });
+
+  if (response.status === 401 && retryAfterRefresh && canRefreshAfterUnauthorized(path)) {
+    const refreshedToken = await refreshAccessToken();
+    if (refreshedToken) {
+      return authorizedFetch(path, init, false);
+    }
+  }
+  return response;
+}
+
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { body, headers, retryAfterRefresh = true, ...rest } = options;
   const isFormData = body instanceof FormData;
@@ -118,34 +169,31 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   const jsonBody: BodyInit | undefined = body && !isFormData && !isNativeBody && typeof body === "object"
     ? JSON.stringify(body)
     : (body as BodyInit | undefined);
-  const token = authStorage.getAccessToken();
   const requestHeaders = new Headers(headers);
   requestHeaders.set("Accept", "application/json");
   if (jsonBody && !isFormData && !requestHeaders.has("Content-Type")) {
     requestHeaders.set("Content-Type", "application/json");
   }
-  if (token) {
-    requestHeaders.set("Authorization", `Bearer ${token}`);
-  }
-  const response = await fetch(endpoint(path), {
+  const response = await authorizedFetch(path, {
     ...rest,
     body: jsonBody,
-    credentials: "include",
     headers: requestHeaders,
-  });
-
-  if (response.status === 401 && retryAfterRefresh && !path.startsWith("/auth/")) {
-    const refreshedToken = await refreshAccessToken();
-    if (refreshedToken) {
-      return request<T>(path, { ...options, retryAfterRefresh: false });
-    }
-  }
+  }, retryAfterRefresh);
 
   const payload = await parsePayload(response);
   if (!response.ok) {
     throw new ApiError(messageFromPayload(payload, `Request failed (${response.status})`), response.status, payload);
   }
   return payload as T;
+}
+
+async function authorizedBlob(path: string, fallbackMessage: string): Promise<Blob> {
+  const response = await authorizedFetch(path, { headers: { Accept: "application/octet-stream" } });
+  if (!response.ok) {
+    const payload = await parsePayload(response);
+    throw new ApiError(messageFromPayload(payload, fallbackMessage), response.status, payload);
+  }
+  return response.blob();
 }
 
 export const api = {
@@ -173,6 +221,16 @@ export const api = {
         authStorage.clear();
       }
     },
+    async restore(): Promise<AuthenticatedPrincipal | undefined> {
+      if (authStorage.wasExplicitlySignedOut()) {
+        return undefined;
+      }
+      if (!authStorage.getAccessToken()) {
+        const refreshedToken = await refreshAccessToken();
+        if (!refreshedToken) return undefined;
+      }
+      return request<AuthenticatedPrincipal>("/auth/me");
+    },
     me: () => request<AuthenticatedPrincipal>("/auth/me"),
   },
   dashboard: () => request<DashboardResponse>("/dashboard"),
@@ -194,35 +252,14 @@ export const api = {
       form.append("file", values.file);
       return request<EcgRecord>("/ecgs", { method: "POST", body: form });
     },
-    async download(ecgId: string): Promise<Blob> {
-      const token = authStorage.getAccessToken();
-      const response = await fetch(endpoint(`/ecgs/${encodeURIComponent(ecgId)}/file`), {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: "include",
-      });
-      if (!response.ok) {
-        const payload = await parsePayload(response);
-        throw new ApiError(messageFromPayload(payload, "The ECG file could not be downloaded."), response.status, payload);
-      }
-      return response.blob();
-    },
+    download: (ecgId: string) => authorizedBlob(`/ecgs/${encodeURIComponent(ecgId)}/file`, "The ECG file could not be downloaded."),
     waveform: (ecgId: string) => request<EcgWaveform>(`/ecgs/${encodeURIComponent(ecgId)}/waveform`),
+    security: (ecgId: string) => request<EcgSecurityStatus>(`/ecgs/${encodeURIComponent(ecgId)}/security`),
   },
   analyses: {
     list: (patientId: string) => request<Analysis[] | PaginatedResponse<Analysis>>(`/analyses?patient_id=${encodeURIComponent(patientId)}`),
     create: (values: { ecg_id: string }) => request<Analysis>("/analyses", { method: "POST", body: values }),
-    async explanation(ecgId: string): Promise<Blob> {
-      const token = authStorage.getAccessToken();
-      const response = await fetch(endpoint(`/ecgs/${encodeURIComponent(ecgId)}/explain.png`), {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: "include",
-      });
-      if (!response.ok) {
-        const payload = await parsePayload(response);
-        throw new ApiError(messageFromPayload(payload, "The model explanation could not be loaded."), response.status, payload);
-      }
-      return response.blob();
-    },
+    explanation: (ecgId: string) => authorizedBlob(`/ecgs/${encodeURIComponent(ecgId)}/explain.png`, "The model explanation could not be loaded."),
   },
   reviews: {
     list: (patientId: string) => request<ClinicalReview[] | PaginatedResponse<ClinicalReview>>(`/reviews?patient_id=${encodeURIComponent(patientId)}`),
@@ -231,18 +268,7 @@ export const api = {
   reports: {
     list: (patientId: string) => request<Report[] | PaginatedResponse<Report>>(`/reports?patient_id=${encodeURIComponent(patientId)}`),
     generate: (reportId: string) => request<Report>(`/reports/${encodeURIComponent(reportId)}/generate-pdf`, { method: "POST" }),
-    async download(reportId: string): Promise<Blob> {
-      const token = authStorage.getAccessToken();
-      const response = await fetch(endpoint(`/reports/${encodeURIComponent(reportId)}/download`), {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: "include",
-      });
-      if (!response.ok) {
-        const payload = await parsePayload(response);
-        throw new ApiError(messageFromPayload(payload, "The report could not be downloaded."), response.status, payload);
-      }
-      return response.blob();
-    },
+    download: (reportId: string) => authorizedBlob(`/reports/${encodeURIComponent(reportId)}/download`, "The report could not be downloaded."),
   },
 };
 

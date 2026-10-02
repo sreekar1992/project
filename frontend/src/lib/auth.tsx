@@ -1,4 +1,5 @@
-import { createContext, useContext, useEffect, useMemo, useState, type PropsWithChildren } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type PropsWithChildren } from "react";
 import { api, authStorage } from "./api";
 import type { AuthenticatedUser } from "../types/api";
 
@@ -13,31 +14,34 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export function AuthProvider({ children }: PropsWithChildren) {
-  const [authenticated, setAuthenticated] = useState(() => Boolean(authStorage.getAccessToken()));
+  const queryClient = useQueryClient();
+  const actionGeneration = useRef(0);
+  const [authenticated, setAuthenticated] = useState(false);
   const [user, setUser] = useState<AuthenticatedUser | undefined>();
-  const [restoring, setRestoring] = useState(() => Boolean(authStorage.getAccessToken()));
+  const [restoring, setRestoring] = useState(true);
 
   useEffect(() => {
-    if (!authStorage.getAccessToken()) {
-      setRestoring(false);
-      return undefined;
-    }
-
     let active = true;
-    void api.auth.me()
+    const generationAtStart = actionGeneration.current;
+    void api.auth.restore()
       .then((principal) => {
-        if (!active) return;
-        setUser(principal);
-        setAuthenticated(true);
+        if (!active || generationAtStart !== actionGeneration.current) return;
+        if (principal) {
+          setUser(principal);
+          setAuthenticated(true);
+        } else {
+          setUser(undefined);
+          setAuthenticated(false);
+        }
       })
       .catch(() => {
-        if (!active) return;
+        if (!active || generationAtStart !== actionGeneration.current) return;
         authStorage.clear();
         setUser(undefined);
         setAuthenticated(false);
       })
       .finally(() => {
-        if (active) setRestoring(false);
+        if (active && generationAtStart === actionGeneration.current) setRestoring(false);
       });
 
     return () => {
@@ -51,18 +55,30 @@ export function AuthProvider({ children }: PropsWithChildren) {
     user,
     async signIn(values) {
       const authenticatedUser = await api.auth.login(values);
+      actionGeneration.current += 1;
       setUser(authenticatedUser);
       setAuthenticated(true);
       setRestoring(false);
       return authenticatedUser;
     },
     async signOut() {
-      await api.auth.logout();
-      setUser(undefined);
-      setAuthenticated(false);
-      setRestoring(false);
+      actionGeneration.current += 1;
+      authStorage.markSignedOut();
+      try {
+        await api.auth.logout();
+      } catch {
+        // Local sign-out must still complete when the server is temporarily
+        // unavailable. The explicit sign-out marker prevents a stale cookie
+        // from restoring this browser session on the next page load.
+      } finally {
+        authStorage.clear();
+        queryClient.clear();
+        setUser(undefined);
+        setAuthenticated(false);
+        setRestoring(false);
+      }
     },
-  }), [authenticated, restoring, user]);
+  }), [authenticated, queryClient, restoring, user]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

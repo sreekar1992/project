@@ -33,15 +33,15 @@ export function DashboardPage() {
 
   return (
     <Stack spacing={3}>
-      <Box>
-        <Typography variant="overline" color="primary.main" sx={{ fontWeight: 800, letterSpacing: 1.6 }}>
-          Hospital research workspace
-        </Typography>
-        <Typography variant="h4">Clinical review dashboard</Typography>
-        <Typography color="text.secondary" sx={{ mt: 0.75 }}>
-          Operational counts are loaded from your authorized hospital tenant. Predictions remain pending until clinician review is recorded.
-        </Typography>
-      </Box>
+      <Paper sx={{ position: "relative", overflow: "hidden", p: { xs: 3, md: 4 }, color: "common.white", backgroundColor: "#075d86", backgroundImage: "linear-gradient(108deg, rgba(4, 48, 82, 0.94), rgba(4, 118, 142, 0.72) 56%, rgba(10, 57, 159, 0.7)), url('/assets/ecg-hero-background.png')", backgroundSize: "cover", backgroundPosition: "center" }}>
+        <Box sx={{ position: "relative", maxWidth: 820 }}>
+          <Typography variant="overline" sx={{ color: "#99faf2" }}>Hospital research workspace</Typography>
+          <Typography variant="h3">Clinical review dashboard</Typography>
+          <Typography sx={{ mt: 1, color: "rgba(242, 253, 255, 0.9)", maxWidth: 720 }}>
+            Operational counts are loaded from your authorized hospital tenant. Predictions remain pending until clinician review is recorded.
+          </Typography>
+        </Box>
+      </Paper>
 
       {metrics.length > 0 ? (
         <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "repeat(2, minmax(0, 1fr))", lg: "repeat(4, minmax(0, 1fr))" }, gap: 2 }}>

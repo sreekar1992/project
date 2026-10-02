@@ -2,6 +2,7 @@ import AddTaskOutlinedIcon from "@mui/icons-material/AddTaskOutlined";
 import ArrowBackOutlinedIcon from "@mui/icons-material/ArrowBackOutlined";
 import CloudUploadOutlinedIcon from "@mui/icons-material/CloudUploadOutlined";
 import PlayCircleOutlineOutlinedIcon from "@mui/icons-material/PlayCircleOutlineOutlined";
+import SecurityOutlinedIcon from "@mui/icons-material/SecurityOutlined";
 import VerifiedUserOutlinedIcon from "@mui/icons-material/VerifiedUserOutlined";
 import { zodResolver } from "@hookform/resolvers/zod";
 import {
@@ -126,6 +127,7 @@ export function PatientDetailPage() {
   const reviews = useQuery({ queryKey: ["reviews", patientId], queryFn: () => api.reviews.list(patientId), enabled: Boolean(patientId) });
   const reports = useQuery({ queryKey: ["reports", patientId], queryFn: () => api.reports.list(patientId), enabled: Boolean(patientId) });
   const waveform = useQuery({ queryKey: ["waveform", viewerEcgId], queryFn: () => api.ecgs.waveform(viewerEcgId), enabled: Boolean(viewerEcgId), staleTime: 5 * 60_000 });
+  const security = useQuery({ queryKey: ["ecg-security", viewerEcgId], queryFn: () => api.ecgs.security(viewerEcgId), enabled: Boolean(viewerEcgId), staleTime: 5 * 60_000 });
   const encounterForm = useForm<EncounterValues>({ resolver: zodResolver(encounterSchema), defaultValues: { encounter_type: "", reason: "" } });
   const reviewForm = useForm<ReviewValues>({ resolver: zodResolver(reviewSchema), defaultValues: {
     analysis_id: "", review_status: "REVIEWED", clinician_notes: "", diagnosis: "", clinical_note: "",
@@ -283,6 +285,31 @@ export function PatientDetailPage() {
             {waveform.isLoading && <LoadingState label="Loading authorized waveform…" />}
             {waveform.isError && <ApiErrorAlert error={waveform.error} />}
             {waveform.data && <EcgWaveformViewer samples={waveform.data.samples} samplingRateHz={waveform.data.sampling_rate_hz} title="Authorized single-lead ECG waveform" />}
+          </Stack>
+        </Paper>
+      )}
+
+      {viewerEcgId && (
+        <Paper sx={{ p: 2.5, borderColor: security.data?.storage.encrypted_at_rest ? "rgba(8, 123, 131, 0.34)" : "warning.light" }}>
+          <Stack spacing={1.5}>
+            <Stack direction={{ xs: "column", sm: "row" }} alignItems={{ sm: "center" }} justifyContent="space-between" gap={1.5}>
+              <Stack direction="row" spacing={1.25} alignItems="center">
+                <Box sx={{ display: "grid", placeItems: "center", width: 38, height: 38, borderRadius: 2, color: "common.white", bgcolor: security.data?.storage.encrypted_at_rest ? "primary.main" : "warning.main" }}><SecurityOutlinedIcon fontSize="small" /></Box>
+                <Box><Typography variant="h6">Security &amp; integrity</Typography><Typography variant="body2" color="text.secondary">Backend-derived protection details for this authorized ECG asset.</Typography></Box>
+              </Stack>
+              {security.data && <Chip color={security.data.storage.encrypted_at_rest ? "success" : "warning"} label={security.data.storage.encrypted_at_rest ? "Encrypted at rest" : "Legacy asset"} size="small" />}
+            </Stack>
+            {security.isLoading && <LinearProgress />}
+            {security.isError && <ApiErrorAlert error={security.error} />}
+            {security.data && (
+              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "repeat(3, minmax(0, 1fr))" }, gap: 1.5 }}>
+                <Box sx={{ p: 1.75, borderRadius: 2, bgcolor: "rgba(8, 123, 131, 0.07)" }}><Typography variant="overline" color="primary.main">At-rest protection</Typography><Typography fontWeight={800}>{security.data.storage.algorithm ?? "Not encrypted"}</Typography><Typography variant="caption" color="text.secondary">{security.data.storage.authenticated_encryption ? "Authenticated encryption with per-object nonce." : security.data.storage.key_management}</Typography></Box>
+                <Box sx={{ p: 1.75, borderRadius: 2, bgcolor: "rgba(17, 87, 167, 0.06)" }}><Typography variant="overline" color="secondary.main">Integrity verification</Typography><Typography fontWeight={800}>{security.data.integrity.algorithm}</Typography><Typography variant="caption" color="text.secondary">Verified on authorized reads · fingerprint {security.data.integrity.fingerprint ?? "not returned"}</Typography></Box>
+                <Box sx={{ p: 1.75, borderRadius: 2, bgcolor: "rgba(22, 47, 66, 0.05)" }}><Typography variant="overline" color="text.secondary">Access control</Typography><Typography fontWeight={800}>Tenant-scoped RBAC</Typography><Typography variant="caption" color="text.secondary">Authorized access and security-status checks are audit logged.</Typography></Box>
+              </Box>
+            )}
+            {security.data?.storage.legacy_unencrypted && <Alert severity="warning">This is a legacy local asset and remains readable for safety. New uploads use AES-256-GCM; migrate or re-upload this record before treating it as encrypted at rest.</Alert>}
+            {security.data && <Typography variant="caption" color="text.secondary">{security.data.research_camouflage.reason}</Typography>}
           </Stack>
         </Paper>
       )}

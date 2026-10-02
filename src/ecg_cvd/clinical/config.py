@@ -32,6 +32,7 @@ class Settings:
     refresh_token_days: int
     object_storage_backend: str
     local_object_storage_path: Path
+    local_asset_encryption_key_path: Path
     object_storage_endpoint: str | None
     object_storage_bucket: str | None
     object_storage_access_key: str | None
@@ -93,6 +94,9 @@ class Settings:
             local_object_storage_path=Path(overrides.get("LOCAL_OBJECT_STORAGE_PATH")
                                            or os.getenv("LOCAL_OBJECT_STORAGE_PATH")
                                            or root / "var" / "clinical_objects").resolve(),
+            local_asset_encryption_key_path=Path(overrides.get("LOCAL_ASSET_ENCRYPTION_KEY_PATH")
+                                                 or os.getenv("LOCAL_ASSET_ENCRYPTION_KEY_PATH")
+                                                 or root / "var" / "clinical_asset_key.bin").resolve(),
             object_storage_endpoint=overrides.get("OBJECT_STORAGE_ENDPOINT")
             or os.getenv("OBJECT_STORAGE_ENDPOINT"),
             object_storage_bucket=overrides.get("OBJECT_STORAGE_BUCKET")

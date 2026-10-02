@@ -19,6 +19,7 @@ import {
   Toolbar,
   Typography,
 } from "@mui/material";
+import { useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/auth";
 import { ClinicalSafetyBanner } from "./ClinicalSafetyBanner";
@@ -33,21 +34,29 @@ const clinicalNavigation = [
 export function AppShell() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
+  const [signingOut, setSigningOut] = useState(false);
   const isSuperAdmin = user?.roles?.includes("SUPER_ADMIN") ?? false;
   const navigation = isSuperAdmin
     ? [{ label: "Super Admin", to: "/super-admin", icon: <AdminPanelSettingsOutlinedIcon /> }]
     : clinicalNavigation;
 
   async function handleSignOut() {
-    await signOut();
-    navigate("/login", { replace: true });
+    if (signingOut) return;
+    setSigningOut(true);
+    try {
+      await signOut();
+    } finally {
+      navigate("/login", { replace: true });
+    }
   }
 
   return (
     <Box sx={{ minHeight: "100vh", bgcolor: "background.default" }}>
-      <AppBar position="fixed" color="inherit" elevation={0} sx={{ borderBottom: "1px solid #dce7e3", zIndex: (theme) => theme.zIndex.drawer + 1 }}>
+      <AppBar position="fixed" color="inherit" elevation={0} sx={{ bgcolor: "rgba(255, 255, 255, 0.86)", borderBottom: "1px solid #d6e5e8", backdropFilter: "blur(16px)", zIndex: (theme) => theme.zIndex.drawer + 1 }}>
         <Toolbar sx={{ gap: 1.5 }}>
-          <MonitorHeartOutlinedIcon color="primary" />
+          <Box sx={{ display: "grid", placeItems: "center", width: 34, height: 34, borderRadius: 2, color: "common.white", background: "linear-gradient(135deg, #0b9ca0, #0a4c91)" }}>
+            <MonitorHeartOutlinedIcon fontSize="small" />
+          </Box>
           <Typography component="div" variant="h6" sx={{ flexGrow: 1, fontWeight: 800 }}>
             ECG Research Clinical Platform
           </Typography>
@@ -55,15 +64,15 @@ export function AppShell() {
           <Typography variant="body2" color="text.secondary" sx={{ display: { xs: "none", md: "block" } }}>
             {user?.display_name ?? user?.name ?? user?.email ?? user?.role ?? "Authenticated user"}
           </Typography>
-          <Button color="inherit" startIcon={<LogoutOutlinedIcon />} onClick={handleSignOut}>
-            Sign out
+          <Button color="inherit" startIcon={<LogoutOutlinedIcon />} disabled={signingOut} onClick={handleSignOut}>
+            {signingOut ? "Signing out…" : "Sign out"}
           </Button>
         </Toolbar>
       </AppBar>
 
       <Drawer
         variant="permanent"
-        sx={{ width: drawerWidth, flexShrink: 0, "& .MuiDrawer-paper": { width: drawerWidth, boxSizing: "border-box", pt: 8, borderRight: "1px solid #dce7e3" } }}
+        sx={{ width: drawerWidth, flexShrink: 0, "& .MuiDrawer-paper": { width: drawerWidth, boxSizing: "border-box", pt: 8, borderRight: "1px solid #d6e5e8", backgroundColor: "#f9fcfd", backgroundImage: "linear-gradient(180deg, rgba(249,252,253,0.88), rgba(249,252,253,0.96)), url('/assets/dna-watermark.png')", backgroundPosition: "center, left bottom", backgroundRepeat: "no-repeat", backgroundSize: "auto, 270px auto" } }}
       >
         <List sx={{ px: 1, py: 2 }}>
           {navigation.map((item) => (
@@ -87,8 +96,8 @@ export function AppShell() {
         </Box>
       </Drawer>
 
-      <Box component="main" sx={{ ml: `${drawerWidth}px`, pt: 10, pb: 5 }}>
-        <Container maxWidth="xl">
+      <Box component="main" sx={{ ml: `${drawerWidth}px`, pt: 10, pb: 5, minHeight: "100vh", backgroundImage: "linear-gradient(rgba(238,246,248,0.93), rgba(238,246,248,0.98)), url('/assets/dna-watermark.png')", backgroundPosition: "center, right bottom", backgroundRepeat: "no-repeat", backgroundSize: "auto, min(620px, 52vw) auto" }}>
+        <Container maxWidth="xl" sx={{ position: "relative" }}>
           <Stack spacing={3}>
             <ClinicalSafetyBanner compact />
             <Outlet />

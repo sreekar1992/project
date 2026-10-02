@@ -442,6 +442,38 @@ class ClinicalService:
         return {**self.ecg_dict(ecg), "file": {"filename": file.original_filename, "content_type": file.content_type,
                                                  "size_bytes": file.size_bytes, "sha256": file.sha256}}
 
+    def ecg_security(self, ecg_uuid: str) -> dict[str, Any]:
+        """Return the true storage-security posture for an authorized ECG asset."""
+        ecg = self._ecg(ecg_uuid)
+        file = self._file_for_ecg(ecg)
+        protection = self.storage.protection_status(file.object_key)
+        audit("ECG_SECURITY_VIEWED", "ecg", str(ecg.ecg_uuid), organization_id=ecg.organization_id)
+        self.session.commit()
+        return {
+            "ecg_uuid": str(ecg.ecg_uuid),
+            "storage": {
+                "encrypted_at_rest": protection.encrypted_at_rest,
+                "algorithm": protection.algorithm,
+                "authenticated_encryption": protection.authenticated_encryption,
+                "key_management": protection.key_management,
+                "legacy_unencrypted": protection.legacy_unencrypted,
+            },
+            "integrity": {
+                "algorithm": "SHA-256",
+                "verified_on_authorized_read": True,
+                "fingerprint": file.sha256[:16],
+            },
+            "access": {
+                "tenant_scoped": True,
+                "server_side_rbac": True,
+                "audited": True,
+            },
+            "research_camouflage": {
+                "used": False,
+                "reason": "Adversarial waveform camouflage is not encryption and is not used for clinical ECG records.",
+            },
+        }
+
     def download_ecg(self, ecg_uuid: str) -> tuple[bytes, ECGFile]:
         ecg = self._ecg(ecg_uuid)
         file = self._file_for_ecg(ecg)

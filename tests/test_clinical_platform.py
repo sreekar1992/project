@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import hashlib
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -17,7 +18,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/ecg-platform-test-mpl")
 
 from ecg_cvd.clinical.app import create_app
 from ecg_cvd.clinical.db import get_session
-from ecg_cvd.clinical.models import (Condition, ECGRecord, PatientOrganization, Prescription, User)
+from ecg_cvd.clinical.models import (Condition, ECGFile, ECGRecord, PatientOrganization, Prescription, User)
 from ecg_cvd.clinical.seed import seed_development_data
 from ecg_cvd.model import RAMNV2
 
@@ -56,6 +57,12 @@ class ClinicalPlatformTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.temp.cleanup()
+
+    def setUp(self):
+        # Each test exercises its own authentication workflow.  Reset the
+        # in-memory local limiter so test ordering cannot consume the shared
+        # login-route quota.
+        self.app.extensions["ecg_platform_limiter"].reset()
 
     def client_for(self, email: str):
         client = self.app.test_client()
@@ -204,6 +211,47 @@ class ClinicalPlatformTests(unittest.TestCase):
         _, headers = self.client_for("doctor@example.test")
         blocked = client.get("/api/v1/patients", headers={**headers, "Origin": "https://attacker.example"})
         self.assertEqual(blocked.status_code, 403, blocked.get_json())
+
+    def test_refresh_cookie_and_logout_work_with_sqlite_timestamps(self):
+        """The refresh-cookie lifecycle must work when SQLite strips tzinfo."""
+        client = self.app.test_client()
+        login = client.post("/api/v1/auth/login", json={"email": "doctor@example.test", "password": PASSWORD})
+        self.assertEqual(login.status_code, 200, login.get_json())
+
+        refreshed = client.post("/api/v1/auth/refresh")
+        self.assertEqual(refreshed.status_code, 200, refreshed.get_json())
+        access_token = refreshed.get_json()["access_token"]
+        identity = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {access_token}"})
+        self.assertEqual(identity.status_code, 200, identity.get_json())
+
+        logout = client.post("/api/v1/auth/logout")
+        self.assertEqual(logout.status_code, 200, logout.get_json())
+        self.assertEqual(logout.get_json()["status"], "logged_out")
+
+        after_logout = client.post("/api/v1/auth/refresh")
+        self.assertEqual(after_logout.status_code, 401, after_logout.get_json())
+
+    def test_new_local_ecg_assets_use_authenticated_aes_gcm_storage(self):
+        client, headers, _patient_id, ecg_id = self.make_patient_and_ecg()
+        security = client.get(f"/api/v1/ecgs/{ecg_id}/security", headers=headers)
+        self.assertEqual(security.status_code, 200, security.get_json())
+        payload = security.get_json()
+        self.assertTrue(payload["storage"]["encrypted_at_rest"])
+        self.assertEqual(payload["storage"]["algorithm"], "AES-256-GCM")
+        self.assertTrue(payload["storage"]["authenticated_encryption"])
+        self.assertTrue(payload["integrity"]["verified_on_authorized_read"])
+        self.assertFalse(payload["research_camouflage"]["used"])
+
+        with self.app.app_context():
+            file = get_session().scalar(select(ECGFile).where(ECGFile.ecg_uuid == uuid.UUID(ecg_id)))
+            self.assertIsNotNone(file)
+            stored = (self.root / "private_objects" / file.object_key).read_bytes()
+            expected_sha256 = file.sha256
+        self.assertTrue(stored.startswith(b"ECG-CLINICAL-AESGCM-1\x00"))
+
+        download = client.get(f"/api/v1/ecgs/{ecg_id}/file", headers=headers)
+        self.assertEqual(download.status_code, 200, download.get_json())
+        self.assertEqual(hashlib.sha256(download.data).hexdigest(), expected_sha256)
 
 
 if __name__ == "__main__":

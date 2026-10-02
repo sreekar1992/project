@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 import hashlib
 import uuid
@@ -125,12 +125,27 @@ def user_from_refresh_token(token: str) -> tuple[User, str]:
         raise APIError("INVALID_TOKEN", "The token type is not a refresh token.", 401)
     session = get_session()
     stored = session.scalar(select(RefreshToken).where(RefreshToken.token_id == str(payload.get("jti"))))
-    if stored is None or stored.revoked_at is not None or stored.expires_at <= utcnow():
+    if stored is None or stored.revoked_at is not None or _expired(stored.expires_at):
         raise APIError("INVALID_TOKEN", "The refresh token has been revoked or expired.", 401)
     user = session.get(User, user_id)
     if user is None or not user.active:
         raise APIError("AUTH_REQUIRED", "The user account is unavailable.", 401)
     return user, stored.token_id
+
+
+def _expired(value: datetime) -> bool:
+    """Compare persisted expiry timestamps safely across SQLite and PostgreSQL.
+
+    SQLite does not preserve timezone information for ``DateTime(timezone=True)``
+    values.  Treat an offset-naive database value as UTC, which matches how the
+    application writes all token expirations.  PostgreSQL values remain aware and
+    are normalized before comparison.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value <= utcnow()
 
 
 def revoke_refresh_token(token_id: str) -> None:

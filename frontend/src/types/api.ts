@@ -131,6 +131,31 @@ export interface EcgWaveform {
   samples: number[];
 }
 
+export interface EcgSecurityStatus {
+  ecg_uuid: Identifier;
+  storage: {
+    encrypted_at_rest: boolean;
+    algorithm?: string | null;
+    authenticated_encryption: boolean;
+    key_management: string;
+    legacy_unencrypted: boolean;
+  };
+  integrity: {
+    algorithm: string;
+    verified_on_authorized_read: boolean;
+    fingerprint?: string;
+  };
+  access: {
+    tenant_scoped: boolean;
+    server_side_rbac: boolean;
+    audited: boolean;
+  };
+  research_camouflage: {
+    used: boolean;
+    reason: string;
+  };
+}
+
 export interface Analysis {
   id: Identifier;
   ecg_id?: Identifier;
