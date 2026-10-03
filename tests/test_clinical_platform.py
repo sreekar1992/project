@@ -64,6 +64,12 @@ class ClinicalPlatformTests(unittest.TestCase):
         # login-route quota.
         self.app.extensions["ecg_platform_limiter"].reset()
 
+    def test_health_probes_do_not_exhaust_application_rate_limit(self):
+        client = self.app.test_client()
+        for _ in range(1000):
+            self.assertEqual(client.get("/healthz").status_code, 200)
+        self.assertEqual(client.get("/readyz").status_code, 200)
+
     def client_for(self, email: str):
         client = self.app.test_client()
         response = client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})

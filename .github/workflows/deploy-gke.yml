@@ -102,7 +102,18 @@ jobs:
         run: |
           set -euo pipefail
           kubectl apply -f /tmp/ecg-gke-release/deployment.yaml
-          kubectl -n ecg-clinical-research rollout status deployment/ecg-platform-api --timeout=300s
-          kubectl -n ecg-clinical-research rollout status deployment/ecg-platform-worker --timeout=300s
-          kubectl -n ecg-clinical-research rollout status deployment/ecg-platform-frontend --timeout=300s
+          check_rollout() {
+            local name="$1"
+            if ! kubectl -n ecg-clinical-research rollout status "deployment/${name}" --timeout=300s; then
+              echo "::group::${name} rollout diagnostics"
+              kubectl -n ecg-clinical-research describe "deployment/${name}" || true
+              kubectl -n ecg-clinical-research get pods -l "app.kubernetes.io/name=${name}" -o wide || true
+              kubectl -n ecg-clinical-research describe pods -l "app.kubernetes.io/name=${name}" || true
+              echo "::endgroup::"
+              return 1
+            fi
+          }
+          check_rollout ecg-platform-api
+          check_rollout ecg-platform-worker
+          check_rollout ecg-platform-frontend
           kubectl -n ecg-clinical-research get service ecg-platform-frontend

@@ -44,9 +44,10 @@ def create_app(overrides: dict | None = None) -> Flask:
     # This memory limiter is intentionally a local fallback. Deployments should
     # set a shared Redis-backed limiter through the reverse proxy/application
     # configuration before handling sensitive clinical traffic.
-    app.extensions["ecg_platform_limiter"] = Limiter(
+    limiter = Limiter(
         key_func=get_remote_address, app=app, default_limits=["1000 per day"], storage_uri="memory://",
     )
+    app.extensions["ecg_platform_limiter"] = limiter
 
     @app.before_request
     def request_context():
@@ -103,10 +104,12 @@ def create_app(overrides: dict | None = None) -> Flask:
                               "request_id": getattr(g, "request_id", "unknown")}), 500
 
     @app.get("/healthz")
+    @limiter.exempt
     def healthz():
         return jsonify(status="ok", service="ecg-health-platform")
 
     @app.get("/readyz")
+    @limiter.exempt
     def readyz():
         model_ready = settings.ai_model_path is not None and settings.ai_model_path.is_file()
         if not model_ready:
