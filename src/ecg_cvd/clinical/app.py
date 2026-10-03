@@ -17,6 +17,7 @@ from werkzeug.exceptions import HTTPException
 from .ai_adapter import ECGModelAdapter
 from .config import Settings
 from .db import Database
+from .medicine_catalog import MedicineCatalog
 from .security import APIError
 from .services import initialize_reference_data, model_version_for
 from .storage import build_storage
@@ -38,6 +39,12 @@ def create_app(overrides: dict | None = None) -> Flask:
     db.init_app(app)
     storage = build_storage(settings)
     app.extensions["ecg_platform_storage"] = storage
+    # The public medicine-name dataset remains outside the clinical database.
+    # Its compact index is built lazily only when an authorized clinician uses
+    # prescription autocomplete, so API startup remains fast.
+    app.extensions["ecg_platform_medicine_catalog"] = MedicineCatalog(
+        settings.medicine_catalog_path, settings.medicine_catalog_index_path,
+    )
     if settings.ai_model_path is not None:
         app.extensions["ecg_platform_adapter"] = ECGModelAdapter(settings.ai_model_path, settings.ai_model_version)
 

@@ -60,6 +60,28 @@ ecg-health-seed --project /Users/sreekarvarma/Documents/project --password 'your
 The seed command never prints or commits that password. It creates only
 `example.test` accounts and clearly fake data.
 
+### Local medicine autocomplete for doctor review
+
+The doctor review form can search a local, read-only medicine-name catalogue
+while the clinician types. The catalogue is **not** a treatment, dose,
+interaction, or contraindication service: it only helps locate a displayed
+medicine name and optional source composition/form text. Dose, route,
+frequency, meal timing, duration, and instructions remain clinician-entered.
+
+The selected Kaggle archive is intentionally Git-ignored rather than bundled
+with the application. Download it once locally:
+
+```bash
+bash scripts/download_medicine_catalog.sh
+```
+
+The default location is
+`data/medicine_catalog/india-medicines-and-drug-info-dataset.zip`. The API
+creates a Git-ignored SQLite prefix index under `var/` on the first authorized
+doctor search. Set `MEDICINE_CATALOG_PATH` and
+`MEDICINE_CATALOG_INDEX_PATH` to use approved alternate locations. The endpoint
+is doctor-only: `GET /api/v1/medicines?query=<prefix>&limit=8`.
+
 ### Run the Compose development stack
 
 ```bash

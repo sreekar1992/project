@@ -14,11 +14,12 @@ from werkzeug.utils import secure_filename
 
 from . import fhir
 from .db import get_session
+from .medicine_catalog import MedicineCatalogError
 from .models import (AIAnalysis, AIModel, AIModelVersion, Condition, DiagnosticReport, ECGRecord,
                      Encounter, Feature, Organization, PatientContact, PatientIdentifier, Practitioner,
                      Prescription, PrescriptionItem, ReportDocument, User)
-from .schemas import (EncounterRequest, FeatureRequest, LoginRequest, OrganizationRequest, PatientMatchRequest,
-                      PatientRequest, ReviewRequest, UserRequest)
+from .schemas import (EncounterRequest, FeatureRequest, ImageDigitizationRequest, LoginRequest,
+                      OrganizationRequest, PatientMatchRequest, PatientRequest, ReviewRequest, UserRequest)
 from .security import (APIError, audit, current_principal, issue_token_pair, password_matches,
                        require_any_permission, require_permission, revoke_refresh_token, settings,
                        user_from_refresh_token)
@@ -129,6 +130,47 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
         return jsonify(user_id=str(user.user_id), display_name=user.display_name, email=user.email,
                        organization_id=str(principal.organization_id) if principal.organization_id else None,
                        roles=sorted(principal.roles))
+
+    @api.get("/ai/model-info")
+    @require_permission("ecg.analyze")
+    def configured_model_info():
+        """Expose safe configured-model provenance to authorized analysis users.
+
+        The response deliberately excludes the host model path and any
+        deployment secrets.  `ecg.analyze` is already required to submit the
+        same raw-waveform data for this model, so this endpoint grants no new
+        clinical-data capability.
+        """
+        return jsonify(ClinicalService(current_principal()).configured_model_info())
+
+    @api.get("/medicines")
+    @require_permission("medication.catalog.read")
+    def medicine_autocomplete():
+        """Return locally indexed medicine-name matches for clinician entry.
+
+        This is a display-only catalog lookup.  It deliberately does not
+        return dosing, route, interaction, or treatment recommendation data;
+        those fields remain clinician-authored in the prescription record.
+        """
+        query = request.args.get("query", "").strip()
+        if len(query) > 100:
+            raise APIError("INVALID_MEDICINE_QUERY", "The medicine search text is too long.", 400)
+        raw_limit = request.args.get("limit", "8")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError) as exc:
+            raise APIError("INVALID_MEDICINE_LIMIT", "limit must be a whole number from 1 through 20.", 400) from exc
+        if not 1 <= limit <= 20:
+            raise APIError("INVALID_MEDICINE_LIMIT", "limit must be a whole number from 1 through 20.", 400)
+        catalog = current_app.extensions["ecg_platform_medicine_catalog"]
+        try:
+            items = catalog.search(query, limit)
+        except MedicineCatalogError as exc:
+            current_app.logger.warning("Medicine autocomplete catalog unavailable: %s", exc)
+            raise APIError("MEDICINE_CATALOG_UNAVAILABLE",
+                           "The local medicine autocomplete catalog is currently unavailable.", 503) from exc
+        return jsonify(items=[item.api_dict() for item in items], query=query,
+                       catalog_available=catalog.available)
 
     @api.get("/dashboard")
     @require_any_permission("patient.read", "patient.self.read")
@@ -326,7 +368,7 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
         uploaded = request.files.get("file")
         encounter_id = request.form.get("encounter_id") or request.form.get("encounter_uuid")
         if uploaded is None or not uploaded.filename:
-            raise APIError("ECG_FILE_REQUIRED", "Choose one ECG .mat or .csv file to upload.", 400)
+            raise APIError("ECG_FILE_REQUIRED", "Choose one ECG .mat, .csv, .jpg, or .jpeg file to upload.", 400)
         if not encounter_id:
             raise APIError("ENCOUNTER_REQUIRED", "An existing encounter is required before ECG upload.", 400)
         service = ClinicalService(current_principal())
@@ -385,6 +427,27 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
     def analyze_ecg(ecg_id: str):
         return _start_analysis(ecg_id)
 
+    @api.post("/ecgs/<ecg_id>/digitize")
+    @require_permission("ecg.analyze")
+    def digitize_ecg_image(ecg_id: str):
+        """Explicitly convert a quality-gated JPEG chart into a research derivative.
+
+        This route is separate from normal upload/analysis so an image is
+        never silently digitized or classified. The original JPEG remains an
+        immutable source asset; callers receive a new encrypted record and
+        its synchronous RAMNV2 research analysis.
+        """
+        payload = _body(ImageDigitizationRequest)
+        result = ClinicalService(current_principal()).digitize_and_analyze_image(
+            ecg_id, payload.output_format,
+        )
+        return jsonify(
+            source_ecg_id=result["source_ecg_id"],
+            derived_ecg=_ecg_response(result["derived_ecg"]),
+            analysis=_analysis_response(result["analysis"]),
+            digitization=result["digitization"],
+        ), 201
+
     @api.post("/analyses")
     @require_permission("ecg.analyze")
     def create_analysis():
@@ -398,6 +461,17 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
     @require_permission("ai.read")
     def ecg_analysis(ecg_id: str):
         return jsonify(_analysis_response(ClinicalService(current_principal()).latest_analysis(ecg_id)))
+
+    @api.get("/ecgs/<ecg_id>/assessment-suggestion")
+    @require_permission("diagnosis.create")
+    def assessment_suggestion(ecg_id: str):
+        """Return an editable research-only draft for an authorized clinician.
+
+        The stricter clinician-review permission keeps this out of technician
+        and patient portals; tenant-scoped ECG lookup is enforced by the
+        service before any model-derived text is returned.
+        """
+        return jsonify(ClinicalService(current_principal()).assessment_suggestion(ecg_id))
 
     @api.get("/analyses")
     @require_permission("ai.read")

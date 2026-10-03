@@ -119,6 +119,14 @@ export interface EcgRecord {
   acquired_at?: string;
   created_at?: string;
   waveform_url?: string;
+  content_type?: string;
+  source_kind?: "WAVEFORM" | "ECG_IMAGE" | "JPEG_DIGITIZED_WAVEFORM" | string;
+  source_ecg_id?: Identifier;
+  provenance?: string | {
+    kind?: string;
+    source_ecg_id?: Identifier;
+    research_only?: boolean;
+  };
   [key: string]: unknown;
 }
 
@@ -156,6 +164,22 @@ export interface EcgSecurityStatus {
   };
 }
 
+export interface ConfiguredResearchModel {
+  status: "CONFIGURED" | string;
+  model_name: string;
+  architecture: string;
+  version: string;
+  framework: string;
+  artifact_sha256?: string;
+  supported_source_formats: string[];
+  image_source_formats: string[];
+  image_policy: string;
+  research_only: boolean;
+  safety?: string;
+  preprocessing?: Record<string, unknown>;
+  metrics?: Record<string, unknown>;
+}
+
 export interface Analysis {
   id: Identifier;
   ecg_id?: Identifier;
@@ -170,6 +194,50 @@ export interface Analysis {
   created_at?: string;
   reviewed_at?: string;
   [key: string]: unknown;
+}
+
+/** A read-only catalogue entry used only to help clinicians find a medicine name. */
+export interface MedicineSuggestion {
+  id?: Identifier;
+  name: string;
+  composition?: string | null;
+  manufacturer?: string | null;
+  category?: string | null;
+}
+
+export interface MedicineCatalogResponse {
+  items: MedicineSuggestion[];
+  query: string;
+  catalog_available: boolean;
+}
+
+/**
+ * Editable wording that summarizes an existing research analysis. It is not a
+ * diagnosis, treatment plan, or prescription recommendation.
+ */
+export interface ResearchAssessmentSuggestion {
+  analysis_id: Identifier;
+  suggestion: string;
+  safety: string;
+}
+
+/**
+ * Server-generated result of an explicitly confirmed JPEG trace digitization.
+ * The derived signal and analysis are research artifacts, not a clinical
+ * interpretation of a photograph or scan.
+ */
+export interface EcgDigitizationResult {
+  source_ecg_id: Identifier;
+  derived_ecg: EcgRecord;
+  analysis: Analysis;
+  digitization: {
+    status: string;
+    source_format: string;
+    output_format: "csv" | "mat" | string;
+    provenance: string;
+    quality?: Record<string, string | number | boolean | null>;
+    limitations: string;
+  };
 }
 
 export interface ClinicalReview {

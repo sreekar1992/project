@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from datetime import datetime
+from io import BytesIO
 import hashlib
 from pathlib import Path
 import uuid
 from typing import Any
 
 from flask import current_app
+import numpy as np
+from scipy.io import savemat
 from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -15,6 +18,9 @@ from werkzeug.security import generate_password_hash
 
 from .ai_adapter import ECGModelAdapter
 from .db import get_session
+from .image_digitization import (OUTPUT_SAMPLING_RATE_HZ, DigitizedTrace,
+                                 digitize_ecg_jpeg)
+from .image_validation import validate_jpeg_image
 from .models import (AIAnalysis, AIModel, AIModelVersion, AIPrediction, AuditEvent, ClinicalNote,
                      Condition, DiagnosticReport, DoctorReview, ECGFile, ECGRecord, Encounter, Feature, Organization,
                      Patient, PatientContact, PatientIdentifier, PatientOrganization, Permission,
@@ -37,7 +43,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "patient.read", "patient.create", "patient.update", "encounter.create", "encounter.read",
         "ecg.read", "ecg.upload", "ecg.analyze", "ai.read", "ai.run", "diagnosis.create",
         "diagnosis.update", "clinical_note.create", "prescription.create", "prescription.update",
-        "report.create", "report.read", "report.download",
+        "report.create", "report.read", "report.download", "medication.catalog.read",
     },
     "TECHNICIAN": {
         "patient.read", "patient.create", "patient.update", "encounter.create", "encounter.read",
@@ -56,6 +62,14 @@ DEFAULT_FEATURES = {
     "FHIR": "FHIR-compatible read mappings",
     "ANALYTICS": "Role-scoped dashboard analytics",
 }
+
+
+WAVEFORM_SUFFIXES = frozenset({".mat", ".csv"})
+JPEG_SUFFIXES = frozenset({".jpg", ".jpeg"})
+JPEG_CONTENT_TYPE = "image/jpeg"
+DIGITIZED_FILE_PURPOSE = "DERIVED_FROM_JPEG"
+DIGITIZED_DEVICE_PREFIX = "EXPERIMENTAL_JPEG_TRACE:"
+DIGITIZATION_PROVENANCE = "EXPERIMENTAL_JPEG_TRACE_DIGITIZATION"
 
 
 def as_uuid(value: str | uuid.UUID, resource: str = "resource") -> uuid.UUID:
@@ -140,6 +154,36 @@ class ClinicalService:
         self.storage: ObjectStorage = current_app.extensions["ecg_platform_storage"]
         self.adapter: ECGModelAdapter | None = current_app.extensions.get("ecg_platform_adapter")
 
+    def configured_model_info(self) -> dict[str, Any]:
+        """Return safe, read-only provenance for the configured research model.
+
+        This intentionally derives metadata from the active adapter rather than
+        returning a browser-supplied label or a host filesystem path.  It is
+        useful before a clinician requests analysis, but is not evidence of
+        clinical validation or a treatment recommendation.
+        """
+        if self.adapter is None:
+            raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model artifact is configured.", 503)
+        try:
+            descriptor = self.adapter.descriptor()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise APIError("MODEL_CONFIGURATION_ERROR", "The configured ECG model artifact is unavailable.", 503) from exc
+        return {
+            "status": "CONFIGURED",
+            "model_name": descriptor.model_name,
+            "architecture": "RAMNV2",
+            "framework": "PyTorch",
+            "version": descriptor.version,
+            "artifact_sha256": descriptor.sha256,
+            "preprocessing": descriptor.preprocessing,
+            "metrics": descriptor.metrics,
+            "supported_source_formats": sorted(WAVEFORM_SUFFIXES),
+            "image_source_formats": sorted(JPEG_SUFFIXES),
+            "image_policy": "JPEG ECG images are retained for authorized visual review only and are not classifier inputs.",
+            "research_only": True,
+            "safety": "Research/clinical-decision-support model only. It is not an autonomous diagnosis or treatment recommendation.",
+        }
+
     def _organization_id(self, explicit: str | uuid.UUID | None = None) -> uuid.UUID:
         if self.principal.organization_id is not None:
             if explicit is not None and as_uuid(explicit, "organization") != self.principal.organization_id:
@@ -213,12 +257,45 @@ class ClinicalService:
                 "status": encounter.status, "start_time": encounter.start_time.isoformat(), "reason": encounter.reason}
 
     @staticmethod
+    def _digitized_source_ecg_id(ecg: ECGRecord) -> str | None:
+        """Return source linkage stored in the existing device field.
+
+        There is no source-asset foreign key in the deployed schema.  The
+        derivative record therefore uses a namespaced, immutable device-id
+        marker rather than pretending that the reconstructed signal came from
+        an acquisition device.  It is intentionally exposed to authorized
+        users in every ECG response.
+        """
+        if not ecg.device_id or not ecg.device_id.startswith(DIGITIZED_DEVICE_PREFIX):
+            return None
+        source_id = ecg.device_id.removeprefix(DIGITIZED_DEVICE_PREFIX)
+        try:
+            return str(uuid.UUID(source_id))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def ecg_dict(ecg: ECGRecord) -> dict[str, Any]:
-        return {"ecg_uuid": str(ecg.ecg_uuid), "patient_uuid": str(ecg.patient_uuid),
-                "encounter_uuid": str(ecg.encounter_uuid), "accession_number": ecg.accession_number,
-                "recorded_at": ecg.recorded_at.isoformat(), "device_id": ecg.device_id,
-                "sampling_rate": ecg.sampling_rate, "lead_count": ecg.lead_count,
-                "duration_seconds": ecg.duration_seconds, "status": ecg.status}
+        image_only = ecg.status == "IMAGE_ONLY"
+        source_ecg_id = ClinicalService._digitized_source_ecg_id(ecg)
+        source_kind = ("ECG_IMAGE" if image_only else
+                       "JPEG_DIGITIZED_WAVEFORM" if source_ecg_id else "WAVEFORM")
+        result: dict[str, Any] = {
+            "ecg_uuid": str(ecg.ecg_uuid), "patient_uuid": str(ecg.patient_uuid),
+            "encounter_uuid": str(ecg.encounter_uuid), "accession_number": ecg.accession_number,
+            "recorded_at": ecg.recorded_at.isoformat(), "device_id": ecg.device_id,
+            "sampling_rate": None if image_only else ecg.sampling_rate,
+            "lead_count": None if image_only else ecg.lead_count,
+            "duration_seconds": None if image_only else ecg.duration_seconds,
+            "source_kind": source_kind, "status": ecg.status,
+        }
+        if source_ecg_id:
+            result["provenance"] = {
+                "kind": DIGITIZATION_PROVENANCE,
+                "source_ecg_id": source_ecg_id,
+                "research_only": True,
+            }
+        return result
 
     def create_organization(self, name: str, code: str) -> dict[str, Any]:
         if not self.principal.is_super_admin:
@@ -397,50 +474,234 @@ class ClinicalService:
         return records
 
     def upload_ecg(self, encounter_uuid: str, payload: bytes, filename: str, device_id: str | None = None) -> dict[str, Any]:
-        if self.adapter is None:
-            raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model is configured for file validation.", 503)
-        if Path(filename).suffix.lower() not in {".mat", ".csv"}:
-            raise APIError("UNSUPPORTED_ECG_FORMAT", "Only .mat and .csv ECG waveforms are accepted.", 400)
+        suffix = Path(filename).suffix.lower()
+        if suffix not in WAVEFORM_SUFFIXES | JPEG_SUFFIXES:
+            raise APIError("UNSUPPORTED_ECG_FORMAT", "Only .mat, .csv, .jpg, and .jpeg ECG files are accepted.", 400)
         if not payload:
             raise APIError("EMPTY_FILE", "The ECG upload is empty.", 400)
         if len(payload) > current_app.config["MAX_CONTENT_LENGTH"]:
             raise APIError("FILE_TOO_LARGE", "The ECG upload exceeds the configured file limit.", 413)
-        self.adapter.validate(payload, filename)
+        image_only = suffix in JPEG_SUFFIXES
+        if image_only:
+            validate_jpeg_image(payload)
+        else:
+            if self.adapter is None:
+                raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model is configured for file validation.", 503)
+            self.adapter.validate(payload, filename)
         encounter = self._encounter(encounter_uuid)
         org = self._organization_id()
         ecg = ECGRecord(patient_uuid=encounter.patient_uuid, encounter_uuid=encounter.encounter_uuid,
                         organization_id=org, accession_number=f"ECG-{uuid.uuid4().hex[:12].upper()}",
-                        device_id=device_id, status="VALIDATING")
+                        device_id=device_id, status="IMAGE_ONLY" if image_only else "VALIDATING")
         self.session.add(ecg)
         self.session.flush()
-        suffix = Path(filename).suffix.lower()
         object_key = f"organizations/{org}/ecgs/{ecg.ecg_uuid}/original/{uuid.uuid4().hex}{suffix}"
-        content_type = "application/x-matlab-data" if suffix == ".mat" else "text/csv"
+        content_type = (JPEG_CONTENT_TYPE if image_only else
+                        "application/x-matlab-data" if suffix == ".mat" else "text/csv")
         stored = self.storage.put_bytes(object_key, payload, content_type)
         self.session.add(ECGFile(ecg_uuid=ecg.ecg_uuid, storage_uri=stored.uri, object_key=stored.object_key,
                                  sha256=stored.sha256, content_type=stored.content_type,
                                  original_filename=Path(filename).name, size_bytes=stored.size_bytes))
-        ecg.status = "READY"
+        if not image_only:
+            ecg.status = "READY"
         self.session.commit()
         audit("ECG_UPLOADED", "ecg", str(ecg.ecg_uuid), organization_id=org,
-              metadata={"format": suffix.removeprefix("."), "size_bytes": stored.size_bytes})
+              metadata={"format": suffix.removeprefix("."), "size_bytes": stored.size_bytes,
+                        "source_kind": "ECG_IMAGE" if image_only else "WAVEFORM"})
         self.session.commit()
-        return self.ecg_dict(ecg)
+        return {**self.ecg_dict(ecg), "filename": Path(filename).name, "content_type": stored.content_type,
+                "size_bytes": stored.size_bytes}
+
+    @staticmethod
+    def _serialize_digitized_trace(trace: DigitizedTrace, output_format: str) -> tuple[bytes, str, str]:
+        """Encode the recovered numerical trace in one supported input format."""
+        if output_format == "csv":
+            output = BytesIO()
+            np.savetxt(output, trace.waveform, delimiter=",", fmt="%.8g")
+            return output.getvalue(), ".csv", "text/csv"
+        if output_format == "mat":
+            output = BytesIO()
+            # ``val`` matches the project parser's explicit, single-lead MAT
+            # convention.  The source JPEG is always retained separately.
+            savemat(output, {"val": trace.waveform.reshape(1, -1)})
+            return output.getvalue(), ".mat", "application/x-matlab-data"
+        raise APIError("INVALID_DIGITIZATION_FORMAT", "Choose either 'csv' or 'mat' for the derived waveform.", 400)
+
+    def digitize_and_analyze_image(self, source_ecg_uuid: str, output_format: str) -> dict[str, Any]:
+        """Create and analyse an encrypted numerical derivative of one JPEG.
+
+        This is intentionally synchronous and explicit: callers must opt into
+        a constrained research experiment, and no JPEG is silently converted
+        or classified during upload.  The original source record/file is never
+        modified; the derivative receives a separate accession, object key,
+        checksum, audit event, and source linkage.
+        """
+        source = self._ecg(source_ecg_uuid)
+        source_file = self._file_for_ecg(source)
+        if source.status != "IMAGE_ONLY" or not self._is_image_only_file(source_file):
+            raise APIError(
+                "DIGITIZATION_SOURCE_REQUIRED",
+                "Experimental digitization is available only for an authorized JPEG ECG image record.",
+                409,
+            )
+        if self.adapter is None:
+            raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model artifact is configured.", 503)
+
+        source_bytes = self.storage.get_bytes(source_file.object_key)
+        if hashlib.sha256(source_bytes).hexdigest() != source_file.sha256:
+            raise APIError("ASSET_INTEGRITY_ERROR", "The source ECG image failed an integrity check.", 500)
+        trace = digitize_ecg_jpeg(source_bytes)
+        derived_bytes, suffix, content_type = self._serialize_digitized_trace(trace, output_format)
+        derived_filename = f"digitized-from-{source_file.ecg_file_id}{suffix}"
+        try:
+            # Validate the serialized output through the same parser used for
+            # every normal upload.  A quality-gated image result is not trusted
+            # merely because this service generated it.
+            validated = self.adapter.validate(derived_bytes, derived_filename)
+        except (ValueError, TypeError, OSError) as exc:
+            raise APIError(
+                "ECG_IMAGE_DIGITIZATION_REJECTED",
+                "The recovered trace did not meet the configured numerical waveform requirements.",
+                422,
+            ) from exc
+        if validated.size != 3600:
+            raise APIError(
+                "ECG_IMAGE_DIGITIZATION_REJECTED",
+                "The recovered trace did not contain the required 3,600 samples.",
+                422,
+            )
+
+        derived = ECGRecord(
+            patient_uuid=source.patient_uuid,
+            encounter_uuid=source.encounter_uuid,
+            organization_id=source.organization_id,
+            accession_number=f"ECG-DIGI-{uuid.uuid4().hex[:12].upper()}",
+            # This field intentionally carries a namespaced provenance marker,
+            # not an acquisition-device assertion. It avoids a schema change
+            # while keeping source linkage visible in all record responses.
+            device_id=f"{DIGITIZED_DEVICE_PREFIX}{source.ecg_uuid}",
+            sampling_rate=OUTPUT_SAMPLING_RATE_HZ,
+            lead_count=1,
+            duration_seconds=10.0,
+            status="READY",
+        )
+        self.session.add(derived)
+        self.session.flush()
+        object_key = (
+            f"organizations/{source.organization_id}/ecgs/{derived.ecg_uuid}/"
+            f"derived/jpeg-trace/{uuid.uuid4().hex}{suffix}"
+        )
+        stored = self.storage.put_bytes(object_key, derived_bytes, content_type)
+        self.session.add(ECGFile(
+            ecg_uuid=derived.ecg_uuid,
+            storage_uri=stored.uri,
+            object_key=stored.object_key,
+            sha256=stored.sha256,
+            content_type=stored.content_type,
+            original_filename=derived_filename,
+            size_bytes=stored.size_bytes,
+            purpose=DIGITIZED_FILE_PURPOSE,
+        ))
+        self.session.commit()
+        audit(
+            "ECG_IMAGE_DIGITIZED",
+            "ecg",
+            str(derived.ecg_uuid),
+            organization_id=derived.organization_id,
+            metadata={
+                "provenance": DIGITIZATION_PROVENANCE,
+                "source_ecg_id": str(source.ecg_uuid),
+                "output_format": output_format,
+                "quality_gate": trace.quality["quality_gate"],
+            },
+        )
+        self.session.commit()
+
+        analysis = self.create_analysis(str(derived.ecg_uuid))
+        completed = self.run_analysis(analysis.ai_analysis_uuid)
+        # Persist origin and quality alongside the model output so later report
+        # viewers cannot mistake this recovered pixel trace for raw telemetry.
+        raw_output = dict(completed.raw_output or {})
+        raw_output["input_provenance"] = {
+            "kind": DIGITIZATION_PROVENANCE,
+            "source_ecg_id": str(source.ecg_uuid),
+            "source_file_sha256": source_file.sha256,
+            "derived_file_sha256": stored.sha256,
+            "output_format": output_format,
+            "quality": trace.quality,
+            "limitations": (
+                "Derived from chart pixels for experimental research only. It is not a calibrated ECG acquisition, "
+                "and its lead identity, amplitude units, timing, and diagnostic fidelity are unknown."
+            ),
+        }
+        completed.raw_output = raw_output
+        self.session.commit()
+        audit(
+            "ECG_IMAGE_DIGITIZATION_ANALYZED",
+            "ai_analysis",
+            str(completed.ai_analysis_uuid),
+            organization_id=derived.organization_id,
+            metadata={"provenance": DIGITIZATION_PROVENANCE, "source_ecg_id": str(source.ecg_uuid)},
+        )
+        self.session.commit()
+        return {
+            "source_ecg_id": str(source.ecg_uuid),
+            "derived_ecg": {
+                **self.ecg_dict(derived),
+                "filename": derived_filename,
+                "content_type": stored.content_type,
+                "size_bytes": stored.size_bytes,
+            },
+            "analysis": self.analysis_dict(completed),
+            "digitization": {
+                "status": "COMPLETED",
+                "provenance": DIGITIZATION_PROVENANCE,
+                "source_kind": "JPEG_DIGITIZED_WAVEFORM",
+                "source_format": JPEG_CONTENT_TYPE,
+                "output_format": output_format,
+                "source_integrity_verified": True,
+                "quality": trace.quality,
+                "limitations": (
+                    "Experimental chart-trace digitization for research only. It is not clinically validated and "
+                    "does not establish a diagnosis, treatment recommendation, or equivalent raw ECG acquisition."
+                ),
+            },
+        }
 
     def _file_for_ecg(self, ecg: ECGRecord) -> ECGFile:
-        file = self.session.scalar(select(ECGFile).where(ECGFile.ecg_uuid == ecg.ecg_uuid,
-                                                         ECGFile.purpose == "ORIGINAL"))
+        # Digitized records are separate derivatives, not replacement source
+        # files.  Their sole asset uses a distinct purpose so provenance stays
+        # queryable without changing the existing database schema.
+        file = self.session.scalar(select(ECGFile).where(
+            ECGFile.ecg_uuid == ecg.ecg_uuid,
+            ECGFile.purpose.in_(("ORIGINAL", DIGITIZED_FILE_PURPOSE)),
+        ).order_by(ECGFile.created_at.asc()))
         if file is None:
             raise APIError("ECG_FILE_NOT_FOUND", "The ECG waveform asset is unavailable.", 404)
         return file
+
+    @staticmethod
+    def _is_image_only_file(file: ECGFile) -> bool:
+        """Return true only for the server-validated JPEG source type."""
+        return file.content_type == JPEG_CONTENT_TYPE
+
+    @staticmethod
+    def _image_only_error() -> APIError:
+        return APIError(
+            "ECG_IMAGE_ONLY",
+            "This record is a JPEG ECG image. The waveform viewer and configured RAMNV2 model require a "
+            "validated numerical .mat or .csv waveform, so no AI prediction was created.",
+            409,
+        )
 
     def get_ecg(self, ecg_uuid: str) -> dict[str, Any]:
         ecg = self._ecg(ecg_uuid)
         file = self._file_for_ecg(ecg)
         audit("ECG_VIEWED", "ecg", str(ecg.ecg_uuid), organization_id=ecg.organization_id)
         self.session.commit()
-        return {**self.ecg_dict(ecg), "file": {"filename": file.original_filename, "content_type": file.content_type,
-                                                 "size_bytes": file.size_bytes, "sha256": file.sha256}}
+        return {**self.ecg_dict(ecg), "filename": file.original_filename, "content_type": file.content_type,
+                "size_bytes": file.size_bytes, "file": {"filename": file.original_filename,
+                "content_type": file.content_type, "size_bytes": file.size_bytes, "sha256": file.sha256}}
 
     def ecg_security(self, ecg_uuid: str) -> dict[str, Any]:
         """Return the true storage-security posture for an authorized ECG asset."""
@@ -485,9 +746,11 @@ class ClinicalService:
         return data, file
 
     def _raw_ecg_waveform(self, ecg: ECGRecord) -> tuple[Any, ECGFile]:
+        file = self._file_for_ecg(ecg)
+        if self._is_image_only_file(file):
+            raise self._image_only_error()
         if self.adapter is None:
             raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model is configured for waveform validation.", 503)
-        file = self._file_for_ecg(ecg)
         data = self.storage.get_bytes(file.object_key)
         if hashlib.sha256(data).hexdigest() != file.sha256:
             raise APIError("ASSET_INTEGRITY_ERROR", "The stored ECG asset failed an integrity check.", 500)
@@ -512,11 +775,13 @@ class ClinicalService:
 
     def create_analysis(self, ecg_uuid: str) -> AIAnalysis:
         ecg = self._ecg(ecg_uuid)
+        file = self._file_for_ecg(ecg)
+        if self._is_image_only_file(file):
+            raise self._image_only_error()
         if self.adapter is None:
             raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model artifact is configured.", 503)
         if ecg.status not in {"READY", "ANALYZED", "REVIEW_REQUIRED", "REVIEWED"}:
             raise APIError("ECG_NOT_READY", "This ECG is not ready for analysis.", 409)
-        file = self._file_for_ecg(ecg)
         version = model_version_for(self.adapter, self.session)
         analysis = AIAnalysis(ecg_uuid=ecg.ecg_uuid, organization_id=ecg.organization_id,
                               model_version_uuid=version.model_version_uuid, status="QUEUED",
@@ -538,6 +803,8 @@ class ClinicalService:
         if self.adapter is None:
             raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model artifact is configured.", 503)
         file = self._file_for_ecg(ecg)
+        if self._is_image_only_file(file):
+            raise self._image_only_error()
         analysis.status = "PROCESSING"
         self.session.commit()
         try:
@@ -606,6 +873,55 @@ class ClinicalService:
         audit("AI_RESULT_VIEWED", "ai_analysis", str(analysis.ai_analysis_uuid), organization_id=ecg.organization_id)
         self.session.commit()
         return self.analysis_dict(analysis)
+
+    def assessment_suggestion(self, ecg_uuid: str) -> dict[str, str]:
+        """Return a clinician-editable, research-only observation draft.
+
+        This is deliberately a faithful description of one completed model
+        output, rather than an interpretation of the waveform.  It never
+        creates a review, diagnosis, or prescription, and callers must keep
+        the clinician-authored assessment separate from this editable draft.
+        """
+        ecg = self._ecg(ecg_uuid)
+        analysis = self.session.scalar(select(AIAnalysis).where(
+            AIAnalysis.ecg_uuid == ecg.ecg_uuid,
+            AIAnalysis.status == "COMPLETED",
+        ).order_by(AIAnalysis.created_at.desc()))
+        if analysis is None:
+            raise APIError(
+                "ANALYSIS_REQUIRED",
+                "A completed AI analysis is required before an assessment draft is available.",
+                409,
+            )
+
+        label = (
+            analysis.predicted_label_name
+            or analysis.predicted_label
+            or "an unavailable model label"
+        ).strip()
+        score_text = ""
+        if (analysis.confidence is not None and np.isfinite(analysis.confidence)
+                and 0.0 <= analysis.confidence <= 1.0):
+            score_text = f" The stored uncalibrated model score is {analysis.confidence:.1%}."
+
+        suggestion = (
+            "Research-only editable draft — replace or delete before saving.\n\n"
+            f"The completed RAMNV2 research analysis recorded the model output label as “{label}”."
+            f"{score_text}\n\n"
+            "Independently inspect the original ECG waveform, recording quality, and relevant clinical context before "
+            "documenting any clinician-authored assessment. This text records an unverified model output only; it does "
+            "not provide a clinical finding, diagnosis, triage decision, treatment plan, or prescription."
+        )
+        safety = (
+            "Editable research-only text only. It is not a diagnosis or calibrated disease probability and must not be "
+            "used to select treatment, prescribe medication, or recommend a medicine, dose, route, frequency, timing, "
+            "or duration. A qualified clinician must independently author the final assessment and any prescription "
+            "record."
+        )
+        audit("AI_ASSESSMENT_SUGGESTION_VIEWED", "ai_analysis", str(analysis.ai_analysis_uuid),
+              organization_id=ecg.organization_id, metadata={"purpose": "editable_research_assessment_draft"})
+        self.session.commit()
+        return {"analysis_id": str(analysis.ai_analysis_uuid), "suggestion": suggestion, "safety": safety}
 
     def explanation_bytes(self, ecg_uuid: str) -> bytes:
         ecg = self._ecg(ecg_uuid)
@@ -747,9 +1063,11 @@ class ClinicalService:
                                         .order_by(Condition.created_at.desc()))
         prescription = self.session.scalar(select(Prescription).where(Prescription.encounter_uuid == ecg.encounter_uuid)
                                           .order_by(Prescription.created_at.desc()))
-        items = self.session.scalars(select(PrescriptionItem).where(
-            PrescriptionItem.prescription_uuid == prescription.prescription_uuid
-        )).all() if prescription else []
+        items = self.session.scalars(
+            select(PrescriptionItem)
+            .where(PrescriptionItem.prescription_uuid == prescription.prescription_uuid)
+            .order_by(PrescriptionItem.created_at)
+        ).all() if prescription else []
         author = self.session.get(User, report.author_id)
         waveform_png = self.waveform_png(ecg)
         pdf = build_ecg_report_pdf(
@@ -761,8 +1079,17 @@ class ClinicalService:
             ai_score=analysis.confidence if analysis else None, model_version=version.version if version else None,
             clinician_assessment=review.assessment if review else report.conclusion,
             diagnosis=condition.display if condition else None,
-            prescription_summary=[" | ".join(filter(None, [item.medicine, item.dose, item.route, item.frequency,
-                                                            item.duration, item.instructions])) for item in items],
+            prescription_items=[
+                {
+                    "medicine": item.medicine,
+                    "dose": item.dose,
+                    "route": item.route,
+                    "frequency": item.frequency,
+                    "duration": item.duration,
+                    "instructions": item.instructions,
+                }
+                for item in items
+            ],
             waveform_png=waveform_png,
         )
         key = f"organizations/{ecg.organization_id}/reports/{report.report_uuid}/{uuid.uuid4().hex}.pdf"

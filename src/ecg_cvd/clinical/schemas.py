@@ -71,6 +71,13 @@ class EncounterRequest(APIModel):
     reason: str | None = Field(default=None, max_length=2000)
 
 
+class ImageDigitizationRequest(APIModel):
+    """Explicit acknowledgement for the narrow JPEG chart-trace experiment."""
+
+    confirm_experimental: Literal[True]
+    output_format: Literal["csv", "mat"] = "csv"
+
+
 class DiagnosisInput(APIModel):
     display: str = Field(min_length=1, max_length=300)
     code_system: str | None = Field(default=None, max_length=200)

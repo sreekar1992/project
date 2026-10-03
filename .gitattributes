@@ -1,0 +1,3 @@
+# Generated report previews are binary artifacts; do not subject their internal
+# PDF byte streams to text whitespace checks or line-ending normalization.
+*.pdf binary

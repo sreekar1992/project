@@ -24,8 +24,11 @@ validated by [`ecg_cvd.gui.read_signal`](../src/ecg_cvd/gui.py):
 | Signal | One finite, non-flat, real-valued, single-lead waveform |
 | Acquisition contract | 10 seconds at 360 Hz (3,600 samples) |
 
-Other leads, sampling rates, durations, images, and malformed MATLAB files are
-rejected instead of silently being resampled or interpreted as an ECG.
+Other leads, sampling rates, durations, and malformed MATLAB files are
+rejected instead of silently being resampled or interpreted as an ECG. The
+hospital upload API may retain a server-validated `.jpg`/`.jpeg` as an
+`IMAGE_ONLY` source artifact, but it is never passed to this numerical adapter
+or treated as a model input.
 
 ## Preprocessing and model contract
 

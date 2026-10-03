@@ -4,13 +4,17 @@ import type {
   AuthTokens,
   AuthenticatedUser,
   ClinicalReview,
+  ConfiguredResearchModel,
   DashboardResponse,
+  EcgDigitizationResult,
   EcgRecord,
   EcgSecurityStatus,
   EcgWaveform,
   Encounter,
+  MedicineCatalogResponse,
   PaginatedResponse,
   Patient,
+  ResearchAssessmentSuggestion,
   Report,
 } from "../types/api";
 
@@ -234,6 +238,10 @@ export const api = {
     me: () => request<AuthenticatedPrincipal>("/auth/me"),
   },
   dashboard: () => request<DashboardResponse>("/dashboard"),
+  researchModel: () => request<ConfiguredResearchModel>("/ai/model-info"),
+  medicines: {
+    search: (query: string) => request<MedicineCatalogResponse>(`/medicines?query=${encodeURIComponent(query)}&limit=8`),
+  },
   patients: {
     list: (query?: URLSearchParams) => request<Patient[] | PaginatedResponse<Patient>>(`/patients${query?.size ? `?${query.toString()}` : ""}`),
     get: (id: string) => request<Patient>(`/patients/${encodeURIComponent(id)}`),
@@ -255,10 +263,15 @@ export const api = {
     download: (ecgId: string) => authorizedBlob(`/ecgs/${encodeURIComponent(ecgId)}/file`, "The ECG file could not be downloaded."),
     waveform: (ecgId: string) => request<EcgWaveform>(`/ecgs/${encodeURIComponent(ecgId)}/waveform`),
     security: (ecgId: string) => request<EcgSecurityStatus>(`/ecgs/${encodeURIComponent(ecgId)}/security`),
+    digitize: (ecgId: string, values: { output_format: "csv" | "mat"; confirm_experimental: true }) => request<EcgDigitizationResult>(
+      `/ecgs/${encodeURIComponent(ecgId)}/digitize`,
+      { method: "POST", body: values },
+    ),
   },
   analyses: {
     list: (patientId: string) => request<Analysis[] | PaginatedResponse<Analysis>>(`/analyses?patient_id=${encodeURIComponent(patientId)}`),
     create: (values: { ecg_id: string }) => request<Analysis>("/analyses", { method: "POST", body: values }),
+    assessmentSuggestion: (ecgId: string) => request<ResearchAssessmentSuggestion>(`/ecgs/${encodeURIComponent(ecgId)}/assessment-suggestion`),
     explanation: (ecgId: string) => authorizedBlob(`/ecgs/${encodeURIComponent(ecgId)}/explain.png`, "The model explanation could not be loaded."),
   },
   reviews: {

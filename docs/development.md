@@ -44,6 +44,27 @@ npm run dev
 
 The Vite server runs on port 5173 and proxies `/api` to port 8080 unless `VITE_API_PROXY_TARGET` or `VITE_API_BASE_URL` changes it. `npm run build` runs TypeScript checking and creates the production static bundle. The client contains no sample patients or fabricated model outputs; it expects an authorized API.
 
+## Local medicine-name autocomplete
+
+Doctor review can query a local read-only medicine-name catalogue at
+`GET /api/v1/medicines?query=<prefix>&limit=8`. It deliberately returns only
+display names and limited source metadata; it must not be treated as a dosing,
+interaction, contraindication, or treatment service. The UI does not use the
+ECG model to choose a medicine, dose, route, frequency, timing, or duration.
+
+Download the separately distributed source archive after reviewing its source
+terms:
+
+```sh
+bash scripts/download_medicine_catalog.sh
+```
+
+The archive is stored under the Git-ignored `data/medicine_catalog/` directory.
+At first authorized search, the API builds a Git-ignored SQLite prefix index in
+`var/medicine_catalog.sqlite3`; it does not import the third-party catalogue
+into the clinical patient database. Override the locations with
+`MEDICINE_CATALOG_PATH` and `MEDICINE_CATALOG_INDEX_PATH` when required.
+
 ## Tests and checks
 
 Run the applicable test suite after changes, for example:

@@ -43,6 +43,8 @@ class Settings:
     async_analysis: bool
     ai_model_path: Path | None
     ai_model_version: str | None
+    medicine_catalog_path: Path
+    medicine_catalog_index_path: Path
     max_upload_bytes: int
     cors_origins: tuple[str, ...]
     public_base_url: str | None
@@ -118,6 +120,13 @@ class Settings:
                                    if "ASYNC_ANALYSIS" in overrides else os.getenv("ASYNC_ANALYSIS"), False),
             ai_model_path=Path(model).resolve() if model else None,
             ai_model_version=overrides.get("AI_MODEL_VERSION") or os.getenv("AI_MODEL_VERSION"),
+            medicine_catalog_path=Path(overrides.get("MEDICINE_CATALOG_PATH")
+                                       or os.getenv("MEDICINE_CATALOG_PATH")
+                                       or root / "data" / "medicine_catalog"
+                                       / "india-medicines-and-drug-info-dataset.zip").resolve(),
+            medicine_catalog_index_path=Path(overrides.get("MEDICINE_CATALOG_INDEX_PATH")
+                                             or os.getenv("MEDICINE_CATALOG_INDEX_PATH")
+                                             or root / "var" / "medicine_catalog.sqlite3").resolve(),
             max_upload_bytes=int(overrides.get("MAX_UPLOAD_BYTES")
                                  or os.getenv("MAX_UPLOAD_BYTES", str(16 * 1024 * 1024))),
             cors_origins=tuple(origins),

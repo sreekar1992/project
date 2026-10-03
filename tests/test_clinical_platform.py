@@ -10,6 +10,7 @@ import unittest
 import uuid
 
 import numpy as np
+from PIL import Image, ImageDraw
 from scipy.io import savemat
 from sqlalchemy import select
 import torch
@@ -18,7 +19,8 @@ os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/ecg-platform-test-mpl")
 
 from ecg_cvd.clinical.app import create_app
 from ecg_cvd.clinical.db import get_session
-from ecg_cvd.clinical.models import (Condition, ECGFile, ECGRecord, PatientOrganization, Prescription, User)
+from ecg_cvd.clinical.models import (AIAnalysis, Condition, DoctorReview, ECGFile, ECGRecord, PatientOrganization,
+                                     Prescription, User)
 from ecg_cvd.clinical.seed import seed_development_data
 from ecg_cvd.model import RAMNV2
 
@@ -29,6 +31,64 @@ PASSWORD = "AResearchOnlyTestPassword!"
 def waveform_mat() -> bytes:
     stream = BytesIO()
     savemat(stream, {"val": np.sin(np.arange(3600, dtype=np.float32) / 17)})
+    return stream.getvalue()
+
+
+def ecg_jpeg() -> bytes:
+    """A small stand-in for an authorized ECG-paper/photo source image."""
+    stream = BytesIO()
+    Image.new("RGB", (96, 48), color=(240, 248, 255)).save(stream, format="JPEG", quality=90)
+    return stream.getvalue()
+
+
+def digitizable_ecg_chart_jpeg() -> bytes:
+    """A clean, single-colour synthetic chart accepted by the strict experiment.
+
+    It deliberately resembles a simple exported waveform plot rather than a
+    paper scan or an arbitrary dashboard screenshot. The test checks that the
+    server only converts this narrow, quality-gated input class.
+    """
+    width, height = 1_200, 420
+    left, right, top, bottom = 72, 1_150, 46, 350
+    image = Image.new("RGB", (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    for x in range(left, right + 1, 108):
+        draw.line((x, top, x, bottom), fill=(226, 233, 236), width=1)
+    for y in range(top, bottom + 1, 61):
+        draw.line((left, y, right, y), fill=(226, 233, 236), width=1)
+    draw.line((left, bottom, right, bottom), fill=(101, 116, 125), width=2)
+    draw.line((left, top, left, bottom), fill=(101, 116, 125), width=2)
+    # A deterministic ECG-like trace with repeating narrow R peaks.  It is
+    # not intended to represent a clinical waveform; it only exercises trace
+    # recovery, serialization, encryption, and model plumbing.
+    sample_count = right - left + 1
+    x = np.linspace(0.0, 10.0, sample_count)
+    signal = 0.10 * np.sin(2 * np.pi * 1.0 * x) + 0.03 * np.sin(2 * np.pi * 3.2 * x)
+    for center in np.arange(0.7, 10.0, 1.0):
+        signal += 1.65 * np.exp(-((x - center) / 0.018) ** 2)
+        signal -= 0.34 * np.exp(-((x - (center + 0.035)) / 0.032) ** 2)
+    signal = (signal - signal.min()) / (signal.max() - signal.min())
+    points = [(left + index, int(300 - value * 195)) for index, value in enumerate(signal)]
+    draw.line(points, fill=(0, 126, 146), width=3, joint="curve")
+    stream = BytesIO()
+    image.save(stream, format="JPEG", quality=96, subsampling=0)
+    return stream.getvalue()
+
+
+def non_chart_screenshot_jpeg() -> bytes:
+    """A colourful UI-like image that must not be treated as an ECG chart."""
+    image = Image.new("RGB", (960, 540), color=(245, 249, 250))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, 960, 62), fill=(10, 130, 145))
+    draw.rectangle((48, 118, 430, 310), fill=(219, 237, 244))
+    draw.rectangle((492, 118, 912, 310), fill=(224, 243, 230))
+    draw.rectangle((48, 355, 912, 485), fill=(238, 241, 245))
+    # Straight decoration lines are purposely not a trace and should fail the
+    # complexity gate even though the screenshot has saturated colours.
+    draw.line((90, 205, 380, 205), fill=(0, 126, 146), width=4)
+    draw.line((540, 205, 865, 205), fill=(0, 126, 146), width=4)
+    stream = BytesIO()
+    image.save(stream, format="JPEG", quality=94, subsampling=0)
     return stream.getvalue()
 
 
@@ -70,13 +130,39 @@ class ClinicalPlatformTests(unittest.TestCase):
             self.assertEqual(client.get("/healthz").status_code, 200)
         self.assertEqual(client.get("/readyz").status_code, 200)
 
+    def test_configured_model_info_is_safe_for_authorized_research_roles_only(self):
+        """Configured RAMNV2 provenance must not disclose the host model path."""
+        for email in ("doctor@example.test", "technician@example.test", "superadmin@example.test"):
+            client, headers = self.client_for(email)
+            response = client.get("/api/v1/ai/model-info", headers=headers)
+            self.assertEqual(response.status_code, 200, response.get_json())
+            payload = response.get_json()
+            self.assertEqual(payload["status"], "CONFIGURED")
+            self.assertEqual(payload["model_name"], "RAMNV2 ECG research classifier")
+            self.assertEqual(payload["architecture"], "RAMNV2")
+            self.assertEqual(payload["framework"], "PyTorch")
+            self.assertEqual(payload["version"], "test-v1")
+            self.assertEqual(payload["supported_source_formats"], [".csv", ".mat"])
+            self.assertEqual(payload["image_source_formats"], [".jpeg", ".jpg"])
+            self.assertTrue(payload["research_only"])
+            self.assertIn("not classifier inputs", payload["image_policy"])
+            self.assertIn("not an autonomous diagnosis", payload["safety"])
+            self.assertNotIn("path", payload)
+            self.assertNotIn(str(self.model_path), response.get_data(as_text=True))
+            self.assertNotIn(str(self.root), response.get_data(as_text=True))
+
+        patient_client, patient_headers = self.client_for("patient@example.test")
+        denied = patient_client.get("/api/v1/ai/model-info", headers=patient_headers)
+        self.assertEqual(denied.status_code, 403, denied.get_json())
+        self.assertEqual(denied.get_json()["error"]["code"], "FORBIDDEN")
+
     def client_for(self, email: str):
         client = self.app.test_client()
         response = client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
         self.assertEqual(response.status_code, 200, response.get_json())
         return client, {"Authorization": f"Bearer {response.get_json()['access_token']}"}
 
-    def make_patient_and_ecg(self):
+    def make_patient_and_encounter(self):
         client, headers = self.client_for("doctor@example.test")
         suffix = uuid.uuid4().hex[:8].upper()
         patient = client.post("/api/v1/patients", headers=headers, json={
@@ -89,12 +175,181 @@ class ClinicalPlatformTests(unittest.TestCase):
             "patient_id": patient_id, "encounter_type": "OUTPATIENT", "reason": "research workflow test",
         })
         self.assertEqual(encounter.status_code, 201, encounter.get_json())
+        return client, headers, patient_id, encounter.get_json()["id"]
+
+    def make_patient_and_ecg(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
         upload = client.post("/api/v1/ecgs", headers=headers, data={
-            "patient_id": patient_id, "encounter_id": encounter.get_json()["id"],
+            "patient_id": patient_id, "encounter_id": encounter_id,
             "file": (BytesIO(waveform_mat()), "sample.mat"),
         })
         self.assertEqual(upload.status_code, 201, upload.get_json())
         return client, headers, patient_id, upload.get_json()["id"]
+
+    def test_jpeg_ecg_upload_is_encrypted_image_only_and_cannot_be_analyzed(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        source = ecg_jpeg()
+        upload = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "file": (BytesIO(source), "paper-tracing.jpg"),
+        })
+        self.assertEqual(upload.status_code, 201, upload.get_json())
+        created = upload.get_json()
+        self.assertEqual(created["status"], "IMAGE_ONLY")
+        self.assertEqual(created["source_kind"], "ECG_IMAGE")
+        self.assertEqual(created["content_type"], "image/jpeg")
+        self.assertIsNone(created["sampling_rate"])
+        ecg_id = created["id"]
+
+        listed = client.get(f"/api/v1/ecgs?patient_id={patient_id}", headers=headers)
+        self.assertEqual(listed.status_code, 200, listed.get_json())
+        self.assertEqual(listed.get_json()[0]["content_type"], "image/jpeg")
+        self.assertEqual(listed.get_json()[0]["source_kind"], "ECG_IMAGE")
+
+        security = client.get(f"/api/v1/ecgs/{ecg_id}/security", headers=headers)
+        self.assertEqual(security.status_code, 200, security.get_json())
+        self.assertTrue(security.get_json()["storage"]["encrypted_at_rest"])
+        self.assertEqual(security.get_json()["storage"]["algorithm"], "AES-256-GCM")
+
+        with self.app.app_context():
+            file = get_session().scalar(select(ECGFile).where(ECGFile.ecg_uuid == uuid.UUID(ecg_id)))
+            self.assertIsNotNone(file)
+            stored = (self.root / "private_objects" / file.object_key).read_bytes()
+            self.assertTrue(stored.startswith(b"ECG-CLINICAL-AESGCM-1\x00"))
+            expected_sha256 = file.sha256
+
+        download = client.get(f"/api/v1/ecgs/{ecg_id}/file", headers=headers)
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download.mimetype, "image/jpeg")
+        self.assertEqual(download.data, source)
+        self.assertEqual(hashlib.sha256(download.data).hexdigest(), expected_sha256)
+
+        waveform = client.get(f"/api/v1/ecgs/{ecg_id}/waveform", headers=headers)
+        self.assertEqual(waveform.status_code, 409, waveform.get_json())
+        self.assertEqual(waveform.get_json()["error"]["code"], "ECG_IMAGE_ONLY")
+        analysis = client.post(f"/api/v1/ecgs/{ecg_id}/analyze", headers=headers)
+        self.assertEqual(analysis.status_code, 409, analysis.get_json())
+        self.assertEqual(analysis.get_json()["error"]["code"], "ECG_IMAGE_ONLY")
+        with self.app.app_context():
+            analyses = get_session().scalars(select(AIAnalysis).where(
+                AIAnalysis.ecg_uuid == uuid.UUID(ecg_id)
+            )).all()
+            self.assertEqual(analyses, [])
+
+    def test_jpeg_extension_requires_a_real_decodable_jpeg(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        response = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "file": (BytesIO(waveform_mat()), "disguised.jpg"),
+        })
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertEqual(response.get_json()["error"]["code"], "INVALID_ECG_IMAGE")
+        listed = client.get(f"/api/v1/ecgs?patient_id={patient_id}", headers=headers)
+        self.assertEqual(listed.status_code, 200, listed.get_json())
+        self.assertEqual(listed.get_json(), [])
+
+    def test_quality_gated_jpeg_digitization_creates_encrypted_provenanced_waveform_and_analysis(self):
+        """A clean chart may opt into a separate, research-only derivative."""
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        source = digitizable_ecg_chart_jpeg()
+        upload = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id,
+            "encounter_id": encounter_id,
+            "file": (BytesIO(source), "clean-chart.jpg"),
+        })
+        self.assertEqual(upload.status_code, 201, upload.get_json())
+        source_id = upload.get_json()["id"]
+
+        # The acknowledgement is intentionally mandatory, so the normal JPEG
+        # upload path can never silently become a classifier input.
+        missing_ack = client.post(f"/api/v1/ecgs/{source_id}/digitize", headers=headers,
+                                  json={"output_format": "csv"})
+        self.assertEqual(missing_ack.status_code, 400, missing_ack.get_json())
+
+        converted = client.post(f"/api/v1/ecgs/{source_id}/digitize", headers=headers, json={
+            "confirm_experimental": True,
+            "output_format": "csv",
+        })
+        self.assertEqual(converted.status_code, 201, converted.get_json())
+        body = converted.get_json()
+        self.assertEqual(body["source_ecg_id"], source_id)
+        self.assertEqual(body["digitization"]["status"], "COMPLETED")
+        self.assertEqual(body["digitization"]["provenance"], "EXPERIMENTAL_JPEG_TRACE_DIGITIZATION")
+        self.assertEqual(body["digitization"]["output_format"], "csv")
+        self.assertTrue(body["digitization"]["source_integrity_verified"])
+        self.assertEqual(body["digitization"]["quality"]["output_samples"], 3600)
+        self.assertIn("not clinically validated", body["digitization"]["limitations"])
+
+        derived = body["derived_ecg"]
+        self.assertIsInstance(derived["id"], str)
+        self.assertEqual(derived["source_kind"], "JPEG_DIGITIZED_WAVEFORM")
+        self.assertEqual(derived["provenance"]["source_ecg_id"], source_id)
+        self.assertEqual(derived["content_type"], "text/csv")
+        analysis = body["analysis"]
+        self.assertIsInstance(analysis["id"], str)
+        self.assertEqual(analysis["ecg_id"], derived["id"])
+        self.assertEqual(analysis["status"], "COMPLETED")
+        self.assertIn("predicted_label", analysis)
+        self.assertTrue(analysis["has_explanation"])
+
+        # The source JPEG stays byte-identical and image-only; the separately
+        # persisted derivative is AES-GCM wrapped and a valid 3,600 sample CSV.
+        original = client.get(f"/api/v1/ecgs/{source_id}/file", headers=headers)
+        self.assertEqual(original.status_code, 200)
+        self.assertEqual(original.data, source)
+        self.assertEqual(client.get(f"/api/v1/ecgs/{source_id}", headers=headers).get_json()["status"], "IMAGE_ONLY")
+        waveform = client.get(f"/api/v1/ecgs/{derived['id']}/waveform", headers=headers)
+        self.assertEqual(waveform.status_code, 200, waveform.get_json())
+        self.assertEqual(len(waveform.get_json()["samples"]), 3600)
+
+        # The caller can request either supported persisted representation;
+        # both are validated through the normal numerical-waveform parser.
+        mat_converted = client.post(f"/api/v1/ecgs/{source_id}/digitize", headers=headers, json={
+            "confirm_experimental": True,
+            "output_format": "mat",
+        })
+        self.assertEqual(mat_converted.status_code, 201, mat_converted.get_json())
+        mat_derived = mat_converted.get_json()["derived_ecg"]
+        self.assertEqual(mat_converted.get_json()["digitization"]["output_format"], "mat")
+        self.assertEqual(mat_derived["content_type"], "application/x-matlab-data")
+        mat_waveform = client.get(f"/api/v1/ecgs/{mat_derived['id']}/waveform", headers=headers)
+        self.assertEqual(mat_waveform.status_code, 200, mat_waveform.get_json())
+        self.assertEqual(len(mat_waveform.get_json()["samples"]), 3600)
+
+        with self.app.app_context():
+            session = get_session()
+            derived_file = session.scalar(select(ECGFile).where(ECGFile.ecg_uuid == uuid.UUID(derived["id"])))
+            self.assertIsNotNone(derived_file)
+            self.assertEqual(derived_file.purpose, "DERIVED_FROM_JPEG")
+            encrypted = (self.root / "private_objects" / derived_file.object_key).read_bytes()
+            self.assertTrue(encrypted.startswith(b"ECG-CLINICAL-AESGCM-1\x00"))
+            stored_analysis = session.get(AIAnalysis, uuid.UUID(analysis["id"]))
+            self.assertEqual(stored_analysis.raw_output["input_provenance"]["source_ecg_id"], source_id)
+            self.assertEqual(stored_analysis.raw_output["input_provenance"]["output_format"], "csv")
+            self.assertEqual(stored_analysis.raw_output["input_provenance"]["quality"]["output_samples"], 3600)
+
+    def test_digitization_rejects_blank_and_non_chart_jpegs_without_creating_derivative(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        for index, source in enumerate((ecg_jpeg(), non_chart_screenshot_jpeg())):
+            upload = client.post("/api/v1/ecgs", headers=headers, data={
+                "patient_id": patient_id,
+                "encounter_id": encounter_id,
+                "file": (BytesIO(source), f"not-a-trace-{index}.jpg"),
+            })
+            self.assertEqual(upload.status_code, 201, upload.get_json())
+            source_id = upload.get_json()["id"]
+            rejected = client.post(f"/api/v1/ecgs/{source_id}/digitize", headers=headers, json={
+                "confirm_experimental": True,
+                "output_format": "mat",
+            })
+            self.assertEqual(rejected.status_code, 422, rejected.get_json())
+            self.assertEqual(rejected.get_json()["error"]["code"], "ECG_IMAGE_DIGITIZATION_REJECTED")
+            self.assertIn("sufficiently isolated", rejected.get_json()["error"]["message"])
+            with self.app.app_context():
+                derivatives = get_session().scalars(select(ECGRecord).where(
+                    ECGRecord.device_id.like(f"EXPERIMENTAL_JPEG_TRACE:{source_id}%")
+                )).all()
+                self.assertEqual(derivatives, [])
 
     def test_real_model_workflow_preserves_prediction_and_requires_review(self):
         client, headers, patient_id, ecg_id = self.make_patient_and_ecg()
@@ -132,6 +387,60 @@ class ClinicalPlatformTests(unittest.TestCase):
         patient_fhir = client.get(f"/api/v1/fhir/Patient/{patient_id}", headers=headers)
         self.assertEqual(patient_fhir.status_code, 200, patient_fhir.get_json())
         self.assertEqual(patient_fhir.get_json()["resourceType"], "Patient")
+
+    def test_assessment_suggestion_is_editable_research_only_and_tenant_scoped(self):
+        client, headers, _patient_id, ecg_id = self.make_patient_and_ecg()
+
+        unavailable = client.get(f"/api/v1/ecgs/{ecg_id}/assessment-suggestion", headers=headers)
+        self.assertEqual(unavailable.status_code, 409, unavailable.get_json())
+        self.assertEqual(unavailable.get_json()["error"]["code"], "ANALYSIS_REQUIRED")
+
+        analysis_response = client.post(f"/api/v1/ecgs/{ecg_id}/analyze", headers=headers)
+        self.assertEqual(analysis_response.status_code, 201, analysis_response.get_json())
+        analysis = analysis_response.get_json()
+
+        response = client.get(f"/api/v1/ecgs/{ecg_id}/assessment-suggestion", headers=headers)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        suggestion = response.get_json()
+        self.assertEqual(suggestion["analysis_id"], analysis["id"])
+        self.assertIn("RAMNV2", suggestion["suggestion"])
+        self.assertIn(analysis["prediction_name"], suggestion["suggestion"])
+        self.assertIn("replace or delete", suggestion["suggestion"])
+        self.assertIn("not provide a clinical finding, diagnosis", suggestion["suggestion"])
+        self.assertNotIn("medicine", suggestion["suggestion"].lower())
+        self.assertNotIn("dose", suggestion["suggestion"].lower())
+        self.assertIn("not a diagnosis", suggestion["safety"].lower())
+        self.assertIn("treatment", suggestion["safety"].lower())
+        self.assertIn("prescribe medication", suggestion["safety"].lower())
+        self.assertIn("dose", suggestion["safety"].lower())
+
+        with self.app.app_context():
+            reviews = get_session().scalars(select(DoctorReview).where(
+                DoctorReview.ecg_uuid == uuid.UUID(ecg_id)
+            )).all()
+        self.assertEqual(reviews, [])
+
+        technician_client, technician_headers = self.client_for("technician@example.test")
+        denied = technician_client.get(f"/api/v1/ecgs/{ecg_id}/assessment-suggestion", headers=technician_headers)
+        self.assertEqual(denied.status_code, 403, denied.get_json())
+        self.assertEqual(denied.get_json()["error"]["code"], "FORBIDDEN")
+
+        super_client, super_headers = self.client_for("superadmin@example.test")
+        suffix = uuid.uuid4().hex[:8]
+        hospital = super_client.post("/api/v1/admin/hospitals", headers=super_headers, json={
+            "name": f"Suggestion Isolation Hospital {suffix}", "code": f"SUG{suffix}",
+        })
+        self.assertEqual(hospital.status_code, 201, hospital.get_json())
+        other_user = super_client.post("/api/v1/admin/users", headers=super_headers, json={
+            "email": f"suggestion-{suffix}@example.test", "password": PASSWORD,
+            "display_name": "Suggestion Isolation Doctor", "role": "DOCTOR",
+            "organization_id": hospital.get_json()["organization_id"],
+        })
+        self.assertEqual(other_user.status_code, 201, other_user.get_json())
+        other_client, other_headers = self.client_for(f"suggestion-{suffix}@example.test")
+        cross_tenant = other_client.get(f"/api/v1/ecgs/{ecg_id}/assessment-suggestion", headers=other_headers)
+        self.assertEqual(cross_tenant.status_code, 404, cross_tenant.get_json())
+        self.assertEqual(cross_tenant.get_json()["error"]["code"], "ECG_NOT_FOUND")
 
     def test_review_api_alias_retains_only_clinician_authored_clinical_fields(self):
         client, headers, _patient_id, ecg_id = self.make_patient_and_ecg()
