@@ -22,12 +22,96 @@ deployment path, tenant-scoped RBAC, EMPI/MRN patient registration, encounters,
 private ECG assets, actual model inference/Grad-CAM, clinician-authored reviews,
 PDF reports with the authorized waveform, FHIR-compatible read mappings, audit
 events, an RQ worker, and a React client with an interactive authorized waveform
-viewer. The legacy one-page workbench and its public demonstration
+viewer. Original ECG material is protected by a literal `DOCTOR` role check by
+default. Other authorized roles see a static mosaic redaction until a doctor
+approves a short-lived, ECG-specific visual-access grant; that grant is not a
+source-file export permission.
+The legacy one-page workbench and its public demonstration
 encryption password remain separate and must not be used for patient records.
 
 Read the actual preserved model contract first: [existing ECG AI interface](docs/existing-ecg-ai-interface.md).
 The platform documentation starts at [development](docs/development.md) and
 [architecture](docs/architecture.md).
+
+### Optional research signal-processing pipeline
+
+`ecg_cvd.research_pipeline.ECGFrameworkPipeline` is a separate, offline
+feature-extraction utility based on the supplied exploratory code. It defaults
+to **360 Hz** for convenience with this repository's numerical recordings, but
+the source sampling rate must be passed explicitly when it differs. Its
+high/low-pass filtering, candidate beat segmentation, CWT-like scalograms,
+simple features, mutual-information selection, and K-means helper are **not**
+the preprocessing or input contract of the deployed PyTorch RAMNV2 checkpoint.
+
+The module does not load or replace `artifacts_final/model.pt`, call the
+clinical API, create a Keras/MobileNet model, return a rhythm prediction, or
+recommend a treatment. `classification_status()` reports `unavailable` until a
+separately trained, versioned research artifact with its own input transform,
+label map, and evaluation is provided. The random DTV-RRL treatment placeholder
+from the source snippet is intentionally disabled.
+
+Its default scalogram backend is built on SciPy and needs no extra dependency.
+If a notebook explicitly requests `backend="pywavelets"`, the module lazy-loads
+PyWavelets and raises an actionable error when it is unavailable; install it in
+that isolated research environment with
+`pip install -e '.[research-cwt]'` (or `pip install 'PyWavelets>=1.6,<2>'`).
+Neither backend is a clinically validated peak detector or image-classifier
+input without separate research validation.
+
+### Separate CWT-MobileNetV2 experiment
+
+`ecg-train-cwt-mobilenetv2` trains a separate, versioned PyTorch CWT-image
+experiment from the MLII class-directory dataset. It has a declared native
+SciPy Morlet CWT transform, RGB conversion, MobileNetV2-style architecture,
+label map, stratified fragment split, class-weighting configuration, metrics,
+and manifest. It does **not** replace `artifacts_final/model.pt`, connect to
+the clinical API, produce calibrated disease probabilities, or provide a
+treatment/prescription output.
+
+Read [the CWT-MobileNetV2 experiment guide](docs/cwt-mobilenetv2-experiment.md)
+before running it. The guide includes a no-training preflight command, a
+versioned training command, output contract, and the critical limitation that
+the default fragment-level split is not a patient-level clinical performance
+estimate.
+
+### Doctor-approved temporary visual access
+
+This is a deliberately narrow workflow for an otherwise authorized, non-doctor
+who needs to visually review one ECG. It is not a way to grant broad clinical
+access or to bypass the original-ECG role boundary.
+
+1. The requester creates an ECG-specific visual-access request. The server
+   records the requester, ECG, patient/tenant scope, expiry, and attempt limit;
+   it notifies active **same-tenant literal `DOCTOR`** users. A super
+   administrator is not a doctor-role bypass.
+2. A same-tenant doctor reviews the requester and ECG, then approves or revokes
+   the request. Approval creates a random, one-time passcode and returns it in
+   that approval response only. The doctor must share it through an approved
+   out-of-band channel; it is not recoverable from the platform later.
+3. The server stores only a short-lived per-grant secret in an
+   AES-256-GCM password envelope (with the project’s scrypt password derivation)
+   so it can verify possession of the passcode. This envelope is not ECG-file
+   encryption and does not contain the source ECG. It is cleared after a
+   successful unlock, expiry, revocation, or lockout.
+4. The requester submits the passcode for the same ECG and receives a
+   short-lived `X-ECG-Visual-Grant` browser credential. React keeps the
+   passcode and credential in component memory only—never local or session
+   storage—so refresh, sign-out, or closing the page loses that browser
+   credential. The server remains authoritative for expiry and revocation.
+
+Requests, approvals, denials, unlock attempts, inline visual reads, and
+revocations are audit logged. Expiry and lockout are evaluated and stored
+server-side. The server binds the grant to the requester, one ECG, its hospital
+tenant, and a server-side digest of the short-lived token identifier; it rejects
+a different requester, ECG, tenant, expired token, or revoked grant.
+
+The resulting session is **visual-only**: it may render the approved ECG
+inline for review, but it cannot download the original source file, obtain a
+presigned/direct object URL, or generate/download a PDF or report export. Those
+routes remain literal-`DOCTOR` operations. Before approval, the protected
+preview is a static mosaic redaction that is generated without reading the
+source asset. It is not encryption, ciphertext, a decryptable image, an
+adversarial transformation, or evidence of protection against model attacks.
 
 ### Run the platform locally
 

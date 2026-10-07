@@ -568,6 +568,135 @@ class ClinicalPlatformTests(unittest.TestCase):
         self.assertEqual(download.status_code, 200, download.get_json())
         self.assertEqual(hashlib.sha256(download.data).hexdigest(), expected_sha256)
 
+    def test_only_doctors_receive_original_ecg_data_or_waveform_visualizations(self):
+        """Role permissions must never make original ECG bytes public.
+
+        This covers both numerical waveform and JPEG source assets plus the
+        less-obvious rendered paths: Grad-CAM and waveform-bearing reports.
+        A literal DOCTOR role is required; SUPER_ADMIN's wildcard permission
+        deliberately does not grant this clinical-data capability.
+        """
+        doctor, doctor_headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        waveform_source = waveform_mat()
+        waveform_upload = doctor.post("/api/v1/ecgs", headers=doctor_headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "file": (BytesIO(waveform_source), "doctor-only.mat"),
+        })
+        self.assertEqual(waveform_upload.status_code, 201, waveform_upload.get_json())
+        waveform_id = waveform_upload.get_json()["id"]
+
+        jpeg_source = ecg_jpeg()
+        image_upload = doctor.post("/api/v1/ecgs", headers=doctor_headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "file": (BytesIO(jpeg_source), "doctor-only.jpg"),
+        })
+        self.assertEqual(image_upload.status_code, 201, image_upload.get_json())
+        image_id = image_upload.get_json()["id"]
+
+        # A doctor retains the complete source-data workflow.
+        waveform = doctor.get(f"/api/v1/ecgs/{waveform_id}/waveform", headers=doctor_headers)
+        self.assertEqual(waveform.status_code, 200, waveform.get_json())
+        self.assertEqual(len(waveform.get_json()["samples"]), 3600)
+        self.assertEqual(doctor.get(f"/api/v1/ecgs/{waveform_id}/file", headers=doctor_headers).data,
+                         waveform_source)
+        self.assertEqual(doctor.get(f"/api/v1/ecgs/{image_id}/file", headers=doctor_headers).data,
+                         jpeg_source)
+        signed = doctor.get(f"/api/v1/ecgs/{waveform_id}/download-url", headers=doctor_headers)
+        self.assertEqual(signed.status_code, 200, signed.get_json())
+        self.assertEqual(signed.get_json()["url"], f"/api/v1/ecgs/{waveform_id}/file")
+
+        analysis = doctor.post(f"/api/v1/ecgs/{waveform_id}/analyze", headers=doctor_headers)
+        self.assertEqual(analysis.status_code, 201, analysis.get_json())
+        explanation = doctor.get(f"/api/v1/ecgs/{waveform_id}/explain.png", headers=doctor_headers)
+        self.assertEqual(explanation.status_code, 200)
+        self.assertTrue(explanation.data.startswith(b"\x89PNG\r\n\x1a\n"))
+        review = doctor.post(f"/api/v1/ecgs/{waveform_id}/review", headers=doctor_headers, json={
+            "doctor_assessment": "Independent clinician review for access-control test.",
+        })
+        self.assertEqual(review.status_code, 201, review.get_json())
+        reports = doctor.get(f"/api/v1/reports?patient_id={patient_id}", headers=doctor_headers)
+        self.assertEqual(reports.status_code, 200, reports.get_json())
+        report_id = reports.get_json()[0]["id"]
+        generated = doctor.post(f"/api/v1/reports/{report_id}/generate-pdf", headers=doctor_headers)
+        self.assertEqual(generated.status_code, 201, generated.get_json())
+        doctor_report = doctor.get(f"/api/v1/reports/{report_id}/download", headers=doctor_headers)
+        self.assertEqual(doctor_report.status_code, 200)
+        self.assertTrue(doctor_report.data.startswith(b"%PDF"))
+
+        # Link a patient-login principal to this exact patient so its request
+        # succeeds tenant/self scope and exercises the doctor-only boundary.
+        with self.app.app_context():
+            ecg = get_session().get(ECGRecord, uuid.UUID(waveform_id))
+            self.assertIsNotNone(ecg)
+            organization_id = str(ecg.organization_id)
+        superadmin, superadmin_headers = self.client_for("superadmin@example.test")
+        patient_email = f"ecg-access-patient-{uuid.uuid4().hex[:10]}@example.test"
+        created_patient_user = superadmin.post("/api/v1/admin/users", headers=superadmin_headers, json={
+            "email": patient_email, "password": PASSWORD, "display_name": "ECG Access Test Patient",
+            "role": "PATIENT", "organization_id": organization_id, "patient_uuid": patient_id,
+        })
+        self.assertEqual(created_patient_user.status_code, 201, created_patient_user.get_json())
+        patient, patient_headers = self.client_for(patient_email)
+        technician, technician_headers = self.client_for("technician@example.test")
+        hospital_admin, hospital_admin_headers = self.client_for("hospitaladmin@example.test")
+
+        blocked_principals = (
+            ("technician", technician, technician_headers),
+            ("hospital administrator", hospital_admin, hospital_admin_headers),
+            ("patient", patient, patient_headers),
+            ("super administrator", superadmin, superadmin_headers),
+        )
+        for label, client, headers in blocked_principals:
+            for ecg_id, original in ((waveform_id, waveform_source), (image_id, jpeg_source)):
+                file_response = client.get(f"/api/v1/ecgs/{ecg_id}/file", headers=headers)
+                self.assertEqual(file_response.status_code, 403, (label, file_response.get_json()))
+                self.assertEqual(file_response.get_json()["error"]["code"], "FORBIDDEN")
+                self.assertNotEqual(file_response.data, original)
+
+                url_response = client.get(f"/api/v1/ecgs/{ecg_id}/download-url", headers=headers)
+                self.assertEqual(url_response.status_code, 403, (label, url_response.get_json()))
+                self.assertNotIn("url", url_response.get_json())
+
+            trace_response = client.get(f"/api/v1/ecgs/{waveform_id}/waveform", headers=headers)
+            self.assertEqual(trace_response.status_code, 403, (label, trace_response.get_json()))
+            self.assertNotIn("samples", trace_response.get_json())
+
+            gradcam_response = client.get(f"/api/v1/ecgs/{waveform_id}/explain.png", headers=headers)
+            self.assertEqual(gradcam_response.status_code, 403, (label, gradcam_response.get_json()))
+            self.assertFalse(gradcam_response.data.startswith(b"\x89PNG\r\n\x1a\n"))
+
+            explanation_url = client.post(f"/api/v1/ecgs/{waveform_id}/explain", headers=headers)
+            self.assertEqual(explanation_url.status_code, 403, (label, explanation_url.get_json()))
+
+            pdf_response = client.get(f"/api/v1/reports/{report_id}/download", headers=headers)
+            self.assertEqual(pdf_response.status_code, 403, (label, pdf_response.get_json()))
+            self.assertFalse(pdf_response.data.startswith(b"%PDF"))
+
+            generate_response = client.post(f"/api/v1/reports/{report_id}/generate-pdf", headers=headers)
+            self.assertEqual(generate_response.status_code, 403, (label, generate_response.get_json()))
+
+            preview = client.get(f"/api/v1/ecgs/{waveform_id}/protected-preview.png", headers=headers)
+            self.assertEqual(preview.status_code, 200, (label, preview.get_json()))
+            self.assertEqual(preview.mimetype, "image/png")
+            self.assertTrue(preview.data.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertNotEqual(preview.data, explanation.data)
+            self.assertNotIn(waveform_source, preview.data)
+            self.assertNotIn(jpeg_source, preview.data)
+            with Image.open(BytesIO(preview.data)) as redacted:
+                self.assertEqual(redacted.size, (1_200, 420))
+                self.assertEqual(redacted.format, "PNG")
+
+        # The patient can see report metadata but never receives a waveform-
+        # bearing download link. The same status response truthfully exposes
+        # storage encryption while marking original access unavailable.
+        patient_reports = patient.get(f"/api/v1/reports?patient_id={patient_id}", headers=patient_headers)
+        self.assertEqual(patient_reports.status_code, 200, patient_reports.get_json())
+        self.assertNotIn("download_url", patient_reports.get_json()[0])
+        patient_security = patient.get(f"/api/v1/ecgs/{waveform_id}/security", headers=patient_headers)
+        self.assertEqual(patient_security.status_code, 200, patient_security.get_json())
+        self.assertFalse(patient_security.get_json()["access"]["original_ecg_available_to_current_user"])
+        self.assertEqual(patient_security.get_json()["access"]["original_ecg_requires_role"], "DOCTOR")
+
 
 if __name__ == "__main__":
     unittest.main()

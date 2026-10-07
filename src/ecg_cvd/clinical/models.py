@@ -237,6 +237,56 @@ class ECGFile(Base, Timestamped):
     purpose: Mapped[str] = mapped_column(String(48), default="ORIGINAL", nullable=False)
 
 
+class ECGVisualAccessGrant(Base, Timestamped):
+    """A doctor-approved, short-lived visual-only access workflow.
+
+    The recipient's passcode and the per-grant secret are deliberately never
+    stored in plaintext.  ``secret_envelope`` contains only the existing
+    password-derived AES-256-GCM envelope; a successful unlock replaces the
+    stored token-JTI digest, so an earlier browser token can be invalidated.
+    This record is not an entitlement for a source-file download or report
+    export -- it is scoped to one user, one ECG, and inline visual routes.
+    """
+
+    __tablename__ = "ecg_visual_access_grants"
+    visual_access_grant_uuid: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    ecg_uuid: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("ecg_records.ecg_uuid"), nullable=False, index=True,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.organization_id"), nullable=False, index=True,
+    )
+    requester_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.user_id"), nullable=False, index=True,
+    )
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.user_id"), index=True)
+    revoked_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.user_id"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", nullable=False, index=True)
+    request_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    passcode_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    access_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    unlocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # A password-derived AES-256-GCM envelope containing a fresh random
+    # per-grant secret.  It is cleared on terminal states where it is no
+    # longer needed; the passcode itself is never persisted.
+    secret_envelope: Mapped[bytes | None] = mapped_column(LargeBinary)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    # SHA-256 of the current JWT jti (not the bearer token) for server-side
+    # revocation and a single active in-browser session per grant.
+    unlock_token_jti_hash: Mapped[str | None] = mapped_column(String(64))
+    __table_args__ = (
+        CheckConstraint("failed_attempts >= 0", name="ck_visual_access_failed_attempts_nonnegative"),
+        CheckConstraint("max_attempts > 0", name="ck_visual_access_max_attempts_positive"),
+        Index("ix_visual_access_org_status", "organization_id", "status", "created_at"),
+        Index("ix_visual_access_requester_ecg", "requester_id", "ecg_uuid", "created_at"),
+    )
+
+
 class AIModel(Base, Timestamped):
     __tablename__ = "ai_models"
     model_uuid: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

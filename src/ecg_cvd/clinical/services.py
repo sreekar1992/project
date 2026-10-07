@@ -1,15 +1,20 @@
 """Server-side tenant-scoped clinical workflow services."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from io import BytesIO
 import hashlib
+import hmac
 from pathlib import Path
+import secrets
 import uuid
 from typing import Any
 
+from cryptography.exceptions import InvalidTag
 from flask import current_app
 import numpy as np
+from PIL import Image, ImageDraw, ImageFilter
 from scipy.io import savemat
 from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
@@ -21,14 +26,16 @@ from .db import get_session
 from .image_digitization import (OUTPUT_SAMPLING_RATE_HZ, DigitizedTrace,
                                  digitize_ecg_jpeg)
 from .image_validation import validate_jpeg_image
+from ..crypto import decrypt_password, encrypt_password
 from .models import (AIAnalysis, AIModel, AIModelVersion, AIPrediction, AuditEvent, ClinicalNote,
-                     Condition, DiagnosticReport, DoctorReview, ECGFile, ECGRecord, Encounter, Feature, Organization,
-                     Patient, PatientContact, PatientIdentifier, PatientOrganization, Permission,
-                     Practitioner, Prescription, PrescriptionItem, ReportDocument, Role, RolePermission,
-                     User, UserRole, utcnow)
+                     Condition, DiagnosticReport, DoctorReview, ECGFile, ECGRecord, ECGVisualAccessGrant,
+                     Encounter, Feature, Notification, Organization, Patient, PatientContact, PatientIdentifier,
+                     PatientOrganization, Permission, Practitioner, Prescription, PrescriptionItem, ReportDocument,
+                     Role, RolePermission, User, UserRole, utcnow)
 from .schemas import (DiagnosisInput, EncounterRequest, FeatureRequest, PatientMatchRequest,
                       PatientRequest, PrescriptionItemInput, ReviewRequest, UserRequest)
-from .security import APIError, Principal, audit
+from .security import (APIError, Principal, audit, issue_ecg_visual_access_token,
+                       visual_access_token_claims)
 from .storage import ObjectStorage
 
 
@@ -70,6 +77,67 @@ JPEG_CONTENT_TYPE = "image/jpeg"
 DIGITIZED_FILE_PURPOSE = "DERIVED_FROM_JPEG"
 DIGITIZED_DEVICE_PREFIX = "EXPERIMENTAL_JPEG_TRACE:"
 DIGITIZATION_PROVENANCE = "EXPERIMENTAL_JPEG_TRACE_DIGITIZATION"
+ORIGINAL_ECG_VIEW_ROLE = "DOCTOR"
+VISUAL_ACCESS_PENDING = "PENDING"
+VISUAL_ACCESS_APPROVED = "APPROVED"
+VISUAL_ACCESS_UNLOCKED = "UNLOCKED"
+VISUAL_ACCESS_REVOKED = "REVOKED"
+VISUAL_ACCESS_EXPIRED = "EXPIRED"
+VISUAL_ACCESS_LOCKED = "LOCKED"
+VISUAL_ACCESS_TERMINAL_STATES = frozenset({
+    VISUAL_ACCESS_REVOKED, VISUAL_ACCESS_EXPIRED, VISUAL_ACCESS_LOCKED,
+})
+
+
+@lru_cache(maxsize=1)
+def protected_ecg_preview_png() -> bytes:
+    """Create a generic blurred placeholder without reading any ECG asset.
+
+    This is intentionally *not* an adversarially perturbed waveform: research
+    camouflage is neither encryption nor a suitable authorization boundary.
+    The fixed rendering contains no source pixels, samples, identifiers, or
+    derived signal characteristics, so it is safe to return to a non-doctor
+    who is otherwise permitted to know that an ECG record exists.
+    """
+    width, height = 1_200, 420
+    canvas = Image.new("RGBA", (width, height), (245, 248, 249, 255))
+    drawing = ImageDraw.Draw(canvas)
+    for x in range(44, width - 44, 56):
+        drawing.line((x, 40, x, height - 40), fill=(198, 215, 216, 150), width=1)
+    for y in range(40, height - 40, 44):
+        drawing.line((44, y, width - 44, y), fill=(198, 215, 216, 150), width=1)
+
+    # These deliberately regular, synthetic strokes make the block visibly
+    # ECG-like without being sampled from (or correlated to) a patient record.
+    points: list[tuple[int, int]] = []
+    for x in range(60, width - 60):
+        phase = (x - 60) % 210
+        if phase < 68:
+            y = height // 2
+        elif phase < 86:
+            y = height // 2 - (phase - 68) * 6
+        elif phase < 105:
+            y = height // 2 + (phase - 86) * 4
+        elif phase < 125:
+            y = height // 2 - (125 - phase) * 2
+        else:
+            y = height // 2
+        points.append((x, y))
+    drawing.line(points, fill=(13, 113, 128, 185), width=7, joint="curve")
+    blurred = canvas.filter(ImageFilter.GaussianBlur(radius=13))
+
+    image = Image.new("RGBA", (width, height), (238, 244, 244, 255))
+    image.alpha_composite(blurred)
+    drawing = ImageDraw.Draw(image)
+    drawing.rounded_rectangle((112, 142, width - 112, 278), radius=18,
+                              fill=(7, 63, 77, 232), outline=(112, 186, 193, 255), width=2)
+    drawing.text((width // 2, 181), "ECG PREVIEW REDACTED", anchor="mm",
+                 fill=(255, 255, 255, 255), font_size=28)
+    drawing.text((width // 2, 221), "Original waveform and image are available to a doctor only.", anchor="mm",
+                 fill=(210, 237, 238, 255), font_size=17)
+    output = BytesIO()
+    image.convert("RGB").save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def as_uuid(value: str | uuid.UUID, resource: str = "resource") -> uuid.UUID:
@@ -153,6 +221,379 @@ class ClinicalService:
         self.session = session or get_session()
         self.storage: ObjectStorage = current_app.extensions["ecg_platform_storage"]
         self.adapter: ECGModelAdapter | None = current_app.extensions.get("ecg_platform_adapter")
+
+    @property
+    def can_view_original_ecg(self) -> bool:
+        """Whether this principal may receive original ECG bytes or visualizations.
+
+        This is intentionally an explicit role check, rather than a permission
+        wildcard check. A platform administrator can administer the platform,
+        but must not receive a patient's original waveform merely through the
+        SUPER_ADMIN ``*`` permission.
+        """
+        return ORIGINAL_ECG_VIEW_ROLE in self.principal.roles
+
+    def _require_original_ecg_view(self, ecg: ECGRecord) -> None:
+        """Block raw ECG disclosure independently of HTTP route decorators."""
+        if self.can_view_original_ecg:
+            return
+        audit("ECG_ORIGINAL_ACCESS_DENIED", "ecg", str(ecg.ecg_uuid), success=False,
+              organization_id=ecg.organization_id,
+              metadata={"reason": "doctor_role_required"})
+        self.session.commit()
+        raise APIError(
+            "ECG_DOCTOR_ONLY",
+            "Only a doctor may view or download the original ECG waveform or image.",
+            403,
+        )
+
+    @staticmethod
+    def _utc(value: datetime) -> datetime:
+        """Normalize SQLite's timezone-naive timestamps to UTC for comparison."""
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _jti_digest(token_id: str) -> str:
+        return hashlib.sha256(token_id.encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _visual_access_expiry(grant: ECGVisualAccessGrant) -> datetime | None:
+        if grant.status == VISUAL_ACCESS_PENDING:
+            return grant.request_expires_at
+        if grant.status == VISUAL_ACCESS_APPROVED:
+            return grant.passcode_expires_at
+        if grant.status == VISUAL_ACCESS_UNLOCKED:
+            return grant.access_expires_at
+        return None
+
+    @staticmethod
+    def _clear_visual_access_material(grant: ECGVisualAccessGrant) -> None:
+        """Erase password-wrapped secret and browser-session correlation data."""
+        grant.secret_envelope = None
+        grant.unlock_token_jti_hash = None
+
+    def _expire_visual_access_grant(self, grant: ECGVisualAccessGrant, now: datetime | None = None) -> bool:
+        """Expire a mutable request/session without trusting client-side clocks."""
+        if grant.status in VISUAL_ACCESS_TERMINAL_STATES:
+            return False
+        deadline = self._visual_access_expiry(grant)
+        current = now or utcnow()
+        if deadline is not None and self._utc(deadline) <= current:
+            grant.status = VISUAL_ACCESS_EXPIRED
+            self._clear_visual_access_material(grant)
+            return True
+        return False
+
+    @staticmethod
+    def _grant_deadline_for_response(grant: ECGVisualAccessGrant) -> datetime | None:
+        return ClinicalService._visual_access_expiry(grant)
+
+    def _visual_access_grant_dict(self, grant: ECGVisualAccessGrant, *, requester_name: str | None = None) -> dict[str, Any]:
+        deadline = self._grant_deadline_for_response(grant)
+        payload: dict[str, Any] = {
+            "request_id": str(grant.visual_access_grant_uuid),
+            "id": str(grant.visual_access_grant_uuid),
+            "ecg_uuid": str(grant.ecg_uuid),
+            "status": grant.status,
+            "requested_at": grant.created_at.isoformat(),
+            "expires_at": deadline.isoformat() if deadline else None,
+            "passcode_expires_at": grant.passcode_expires_at.isoformat() if grant.passcode_expires_at else None,
+            "access_expires_at": grant.access_expires_at.isoformat() if grant.access_expires_at else None,
+            "attempts_remaining": max(0, grant.max_attempts - grant.failed_attempts),
+            "visual_only": True,
+            "grant_header": "X-ECG-Visual-Grant",
+        }
+        if requester_name is not None:
+            payload["requester"] = {
+                "user_id": str(grant.requester_id),
+                "display_name": requester_name,
+            }
+        return payload
+
+    def _require_doctor_for_visual_access_administration(self) -> uuid.UUID:
+        """Return the doctor's tenant, never treating SUPER_ADMIN as a doctor."""
+        if ORIGINAL_ECG_VIEW_ROLE not in self.principal.roles or self.principal.organization_id is None:
+            audit("ECG_VISUAL_ACCESS_ADMIN_DENIED", "ecg_visual_access_grant", success=False,
+                  metadata={"reason": "literal_doctor_role_required"})
+            self.session.commit()
+            raise APIError("FORBIDDEN", "Only a doctor in this hospital may approve or revoke ECG visual access.", 403)
+        return self.principal.organization_id
+
+    def _deny_visual_access(self, ecg: ECGRecord, *, reason: str) -> None:
+        audit("ECG_VISUAL_ACCESS_DENIED", "ecg", str(ecg.ecg_uuid), success=False,
+              organization_id=ecg.organization_id, metadata={"reason": reason})
+        self.session.commit()
+        raise APIError(
+            "ECG_VISUAL_ACCESS_REQUIRED",
+            "A doctor-approved visual-access grant is required to view this original ECG.",
+            403,
+        )
+
+    def _require_ecg_visual_access(self, ecg: ECGRecord) -> None:
+        """Authorize a doctor or a valid, scoped, in-browser visual grant.
+
+        This does *not* authorize raw file/download/PDF export routes.  It is
+        intentionally separate from ``_require_original_ecg_view`` so future
+        service callers must choose the narrower capability explicitly.
+        """
+        if self.can_view_original_ecg:
+            return
+        claims = visual_access_token_claims()
+        if claims is None:
+            self._deny_visual_access(ecg, reason="grant_header_missing")
+        try:
+            claimant_id = uuid.UUID(str(claims["sub"]))
+            claimed_ecg_id = uuid.UUID(str(claims["ecg"]))
+            grant_id = uuid.UUID(str(claims["grant"]))
+            token_id = str(claims["jti"])
+        except (KeyError, TypeError, ValueError):
+            self._deny_visual_access(ecg, reason="grant_claims_invalid")
+        if claimant_id != self.principal.user_id or claimed_ecg_id != ecg.ecg_uuid:
+            self._deny_visual_access(ecg, reason="grant_scope_mismatch")
+        grant = self.session.get(ECGVisualAccessGrant, grant_id)
+        if grant is None:
+            self._deny_visual_access(ecg, reason="grant_not_found")
+        if (grant.ecg_uuid != ecg.ecg_uuid or grant.organization_id != ecg.organization_id
+                or grant.requester_id != self.principal.user_id):
+            self._deny_visual_access(ecg, reason="grant_record_mismatch")
+        expired = self._expire_visual_access_grant(grant)
+        expected_digest = grant.unlock_token_jti_hash or ""
+        if (expired or grant.status != VISUAL_ACCESS_UNLOCKED or grant.access_expires_at is None
+                or self._utc(grant.access_expires_at) <= utcnow()
+                or not hmac.compare_digest(expected_digest, self._jti_digest(token_id))):
+            self._deny_visual_access(ecg, reason="grant_inactive")
+        audit("ECG_VISUAL_ACCESS_GRANTED", "ecg", str(ecg.ecg_uuid), organization_id=ecg.organization_id,
+              metadata={"grant_id": str(grant.visual_access_grant_uuid), "mode": "inline_visual_only"})
+        self.session.commit()
+
+    def request_visual_access(self, ecg_uuid: str) -> dict[str, Any]:
+        """Create a tenant/patient-scoped request for doctor-approved viewing."""
+        ecg = self._ecg(ecg_uuid)
+        if self.can_view_original_ecg:
+            raise APIError("VISUAL_ACCESS_NOT_REQUIRED", "Doctors already have direct ECG visual access.", 409)
+        now = utcnow()
+        existing = self.session.scalars(select(ECGVisualAccessGrant).where(
+            ECGVisualAccessGrant.ecg_uuid == ecg.ecg_uuid,
+            ECGVisualAccessGrant.requester_id == self.principal.user_id,
+        ).order_by(ECGVisualAccessGrant.created_at.desc())).all()
+        active: ECGVisualAccessGrant | None = None
+        for grant in existing:
+            self._expire_visual_access_grant(grant, now)
+            if grant.status in {VISUAL_ACCESS_PENDING, VISUAL_ACCESS_APPROVED, VISUAL_ACCESS_UNLOCKED}:
+                active = grant
+                break
+        if active is not None:
+            self.session.commit()
+            raise APIError("VISUAL_ACCESS_REQUEST_EXISTS",
+                           "An active visual-access request already exists for this ECG.", 409)
+        request_hours = max(1, int(current_app.extensions["ecg_platform_settings"].visual_access_request_hours))
+        max_attempts = max(1, min(10, int(current_app.extensions["ecg_platform_settings"].visual_access_max_attempts)))
+        grant = ECGVisualAccessGrant(
+            ecg_uuid=ecg.ecg_uuid,
+            organization_id=ecg.organization_id,
+            requester_id=self.principal.user_id,
+            status=VISUAL_ACCESS_PENDING,
+            request_expires_at=now + timedelta(hours=request_hours),
+            max_attempts=max_attempts,
+        )
+        self.session.add(grant)
+        self.session.flush()
+        doctor_users = self.session.scalars(
+            select(User).join(UserRole, UserRole.user_id == User.user_id)
+            .join(Role, Role.role_id == UserRole.role_id)
+            .where(
+                User.active.is_(True),
+                User.organization_id == ecg.organization_id,
+                Role.name == ORIGINAL_ECG_VIEW_ROLE,
+                UserRole.organization_id == ecg.organization_id,
+            )
+        ).all()
+        for doctor in {user.user_id: user for user in doctor_users}.values():
+            self.session.add(Notification(
+                user_id=doctor.user_id,
+                organization_id=ecg.organization_id,
+                kind="ECG_VISUAL_ACCESS_REQUEST",
+                message="An ECG visual-access request is awaiting doctor review.",
+            ))
+        audit("ECG_VISUAL_ACCESS_REQUESTED", "ecg_visual_access_grant", str(grant.visual_access_grant_uuid),
+              organization_id=ecg.organization_id,
+              metadata={"ecg_id": str(ecg.ecg_uuid), "doctor_notification_count": len({u.user_id for u in doctor_users})})
+        self.session.commit()
+        return self._visual_access_grant_dict(grant)
+
+    def current_visual_access_grant(self, ecg_uuid: str) -> dict[str, Any] | None:
+        """Return only the signed-in requester's latest grant state for one ECG."""
+        ecg = self._ecg(ecg_uuid)
+        grant = self.session.scalar(select(ECGVisualAccessGrant).where(
+            ECGVisualAccessGrant.ecg_uuid == ecg.ecg_uuid,
+            ECGVisualAccessGrant.requester_id == self.principal.user_id,
+        ).order_by(ECGVisualAccessGrant.created_at.desc()))
+        if grant is None:
+            return None
+        changed = self._expire_visual_access_grant(grant)
+        if changed:
+            self.session.commit()
+        return self._visual_access_grant_dict(grant)
+
+    def list_visual_access_requests(self, status: str | None = None) -> list[dict[str, Any]]:
+        """List requests only for literal doctors in their hospital tenant."""
+        organization_id = self._require_doctor_for_visual_access_administration()
+        normalized = status.strip().upper() if status else None
+        allowed = {VISUAL_ACCESS_PENDING, VISUAL_ACCESS_APPROVED, VISUAL_ACCESS_UNLOCKED,
+                   VISUAL_ACCESS_REVOKED, VISUAL_ACCESS_EXPIRED, VISUAL_ACCESS_LOCKED}
+        if normalized is not None and normalized not in allowed:
+            raise APIError("INVALID_VISUAL_ACCESS_STATUS", "The visual-access status filter is invalid.", 400)
+        rows = self.session.execute(
+            select(ECGVisualAccessGrant, User.display_name)
+            .join(User, User.user_id == ECGVisualAccessGrant.requester_id)
+            .where(ECGVisualAccessGrant.organization_id == organization_id)
+            .order_by(ECGVisualAccessGrant.created_at.desc())
+        ).all()
+        result: list[dict[str, Any]] = []
+        for grant, display_name in rows:
+            self._expire_visual_access_grant(grant)
+            if normalized is None or grant.status == normalized:
+                result.append(self._visual_access_grant_dict(grant, requester_name=display_name))
+        audit("ECG_VISUAL_ACCESS_REQUESTS_VIEWED", "ecg_visual_access_grant", organization_id=organization_id,
+              metadata={"status": normalized, "count": len(result)})
+        self.session.commit()
+        return result
+
+    def _visual_access_grant_for_doctor(self, request_id: str) -> ECGVisualAccessGrant:
+        organization_id = self._require_doctor_for_visual_access_administration()
+        grant_id = as_uuid(request_id, "visual-access request")
+        grant = self.session.scalar(select(ECGVisualAccessGrant).where(
+            ECGVisualAccessGrant.visual_access_grant_uuid == grant_id,
+            ECGVisualAccessGrant.organization_id == organization_id,
+        ))
+        if grant is None:
+            raise APIError("VISUAL_ACCESS_REQUEST_NOT_FOUND", "The visual-access request could not be found.", 404)
+        return grant
+
+    def approve_visual_access_request(self, request_id: str) -> dict[str, Any]:
+        """Doctor-approve once and return the random passcode exactly once."""
+        grant = self._visual_access_grant_for_doctor(request_id)
+        if self._expire_visual_access_grant(grant):
+            self.session.commit()
+        if grant.status != VISUAL_ACCESS_PENDING:
+            raise APIError("VISUAL_ACCESS_REQUEST_UNAVAILABLE",
+                           "This visual-access request is no longer awaiting approval.", 409)
+        now = utcnow()
+        passcode_minutes = max(1, min(60, int(current_app.extensions[
+            "ecg_platform_settings"].visual_access_passcode_minutes)))
+        # urlsafe tokens have much more entropy than a human-chosen PIN and
+        # exceed crypto.encrypt_password's minimum passphrase length.
+        passcode = secrets.token_urlsafe(24)
+        grant.secret_envelope = encrypt_password(secrets.token_bytes(32), passcode)
+        grant.status = VISUAL_ACCESS_APPROVED
+        grant.approved_by = self.principal.user_id
+        grant.approved_at = now
+        grant.passcode_expires_at = now + timedelta(minutes=passcode_minutes)
+        grant.access_expires_at = None
+        grant.unlocked_at = None
+        grant.failed_attempts = 0
+        grant.unlock_token_jti_hash = None
+        audit("ECG_VISUAL_ACCESS_APPROVED", "ecg_visual_access_grant", str(grant.visual_access_grant_uuid),
+              organization_id=grant.organization_id,
+              metadata={"ecg_id": str(grant.ecg_uuid), "passcode_delivery": "response_once"})
+        self.session.commit()
+        return {
+            **self._visual_access_grant_dict(grant),
+            "passcode": passcode,
+            "passcode_returned_once": True,
+            "safety": "Share the passcode through an approved out-of-band channel. It is not stored and cannot be retrieved again.",
+        }
+
+    def unlock_visual_access_request(self, request_id: str, passcode: str, *,
+                                     expected_ecg_uuid: str | None = None) -> dict[str, Any]:
+        """Consume a doctor's passcode and issue one short-lived browser token."""
+        grant_id = as_uuid(request_id, "visual-access request")
+        grant = self.session.scalar(select(ECGVisualAccessGrant).where(
+            ECGVisualAccessGrant.visual_access_grant_uuid == grant_id,
+            ECGVisualAccessGrant.requester_id == self.principal.user_id,
+        ))
+        if grant is None:
+            raise APIError("VISUAL_ACCESS_REQUEST_NOT_FOUND", "The visual-access request could not be found.", 404)
+        if expected_ecg_uuid is not None and as_uuid(expected_ecg_uuid, "ECG") != grant.ecg_uuid:
+            # The route's ECG scope is part of the anti-confusion boundary:
+            # an otherwise valid request must never unlock a different record.
+            raise APIError("VISUAL_ACCESS_REQUEST_NOT_FOUND", "The visual-access request could not be found.", 404)
+        # The normal authenticated ECG lookup prevents a user with a stale or
+        # cross-tenant account context from unlocking an unrelated record.
+        ecg = self._ecg(grant.ecg_uuid)
+        if ecg.organization_id != grant.organization_id:
+            raise APIError("VISUAL_ACCESS_REQUEST_NOT_FOUND", "The visual-access request could not be found.", 404)
+        if self._expire_visual_access_grant(grant):
+            self.session.commit()
+        if grant.status != VISUAL_ACCESS_APPROVED or not grant.secret_envelope:
+            audit("ECG_VISUAL_ACCESS_UNLOCK_DENIED", "ecg_visual_access_grant", str(grant.visual_access_grant_uuid),
+                  success=False, organization_id=grant.organization_id, metadata={"reason": "grant_unavailable"})
+            self.session.commit()
+            raise APIError("VISUAL_ACCESS_GRANT_UNAVAILABLE", "The visual-access passcode is no longer available.", 409)
+        try:
+            secret = decrypt_password(bytes(grant.secret_envelope), passcode)
+            if len(secret) != 32:
+                raise ValueError("Invalid per-grant secret length.")
+        except (InvalidTag, ValueError, UnicodeError):
+            grant.failed_attempts += 1
+            attempts_remaining = max(0, grant.max_attempts - grant.failed_attempts)
+            if attempts_remaining == 0:
+                grant.status = VISUAL_ACCESS_LOCKED
+                self._clear_visual_access_material(grant)
+            audit("ECG_VISUAL_ACCESS_UNLOCK_DENIED", "ecg_visual_access_grant", str(grant.visual_access_grant_uuid),
+                  success=False, organization_id=grant.organization_id,
+                  metadata={"reason": "invalid_passcode", "attempts_remaining": attempts_remaining})
+            self.session.commit()
+            raise APIError("INVALID_VISUAL_ACCESS_PASSCODE",
+                           "The passcode is invalid or no longer available.", 401)
+        # The wrapped secret served its sole purpose: authenticate possession
+        # of the one-time passcode. Do not keep it after a successful unlock.
+        session_minutes = max(1, min(30, int(current_app.extensions[
+            "ecg_platform_settings"].visual_access_session_minutes)))
+        expires_at = utcnow() + timedelta(minutes=session_minutes)
+        token, token_id = issue_ecg_visual_access_token(
+            user_id=self.principal.user_id,
+            ecg_id=ecg.ecg_uuid,
+            grant_id=grant.visual_access_grant_uuid,
+            expires_at=expires_at,
+        )
+        grant.status = VISUAL_ACCESS_UNLOCKED
+        grant.unlocked_at = utcnow()
+        grant.access_expires_at = expires_at
+        self._clear_visual_access_material(grant)
+        grant.unlock_token_jti_hash = self._jti_digest(token_id)
+        audit("ECG_VISUAL_ACCESS_UNLOCKED", "ecg_visual_access_grant", str(grant.visual_access_grant_uuid),
+              organization_id=grant.organization_id,
+              metadata={"ecg_id": str(ecg.ecg_uuid), "mode": "inline_visual_only"})
+        self.session.commit()
+        return {
+            "request_id": str(grant.visual_access_grant_uuid),
+            "ecg_uuid": str(ecg.ecg_uuid),
+            "access_token": token,
+            "token_type": "ECG-Visual-Grant",
+            "expires_at": expires_at.isoformat(),
+            "expires_in_seconds": session_minutes * 60,
+            "grant_header": "X-ECG-Visual-Grant",
+            "scope": "inline_ecg_visual_only",
+        }
+
+    def revoke_visual_access_request(self, request_id: str) -> dict[str, Any]:
+        """Revoke a pending, approved, or active visual session as its doctor."""
+        grant = self._visual_access_grant_for_doctor(request_id)
+        self._expire_visual_access_grant(grant)
+        if grant.status in VISUAL_ACCESS_TERMINAL_STATES:
+            self.session.commit()
+            raise APIError("VISUAL_ACCESS_REQUEST_UNAVAILABLE", "This visual-access request is already closed.", 409)
+        grant.status = VISUAL_ACCESS_REVOKED
+        grant.revoked_at = utcnow()
+        grant.revoked_by = self.principal.user_id
+        self._clear_visual_access_material(grant)
+        audit("ECG_VISUAL_ACCESS_REVOKED", "ecg_visual_access_grant", str(grant.visual_access_grant_uuid),
+              organization_id=grant.organization_id, metadata={"ecg_id": str(grant.ecg_uuid)})
+        self.session.commit()
+        return self._visual_access_grant_dict(grant)
 
     def configured_model_info(self) -> dict[str, Any]:
         """Return safe, read-only provenance for the configured research model.
@@ -703,6 +1144,48 @@ class ClinicalService:
                 "size_bytes": file.size_bytes, "file": {"filename": file.original_filename,
                 "content_type": file.content_type, "size_bytes": file.size_bytes, "sha256": file.sha256}}
 
+    def protected_preview(self, ecg_uuid: str) -> bytes:
+        """Return a generic blurred image for a scoped, non-doctor viewer.
+
+        The record lookup still enforces tenant and patient scope, but this
+        method deliberately never calls ``_file_for_ecg`` or storage. It is a
+        static redaction representation, not a decodable/encrypted form of the
+        source ECG and not research adversarial camouflage.
+        """
+        ecg = self._ecg(ecg_uuid)
+        audit("ECG_REDACTED_PREVIEW_VIEWED", "ecg", str(ecg.ecg_uuid),
+              organization_id=ecg.organization_id,
+              metadata={"representation": "static_blurred_redaction"})
+        self.session.commit()
+        return protected_ecg_preview_png()
+
+    def visual_image(self, ecg_uuid: str) -> tuple[bytes, str]:
+        """Return an inline-only original visual after doctor/grant approval.
+
+        JPEG source records are rendered as their stored image bytes. Numerical
+        records are rendered server-side to PNG so a grant recipient never
+        receives the source MAT/CSV or the raw waveform sample array.  This is
+        still sensitive visual content and is protected by the same narrow
+        doctor-or-scoped-grant check as Grad-CAM.
+        """
+        ecg = self._ecg(ecg_uuid)
+        self._require_ecg_visual_access(ecg)
+        file = self._file_for_ecg(ecg)
+        if self._is_image_only_file(file):
+            data = self.storage.get_bytes(file.object_key)
+            if hashlib.sha256(data).hexdigest() != file.sha256:
+                raise APIError("ASSET_INTEGRITY_ERROR", "The stored ECG asset failed an integrity check.", 500)
+            content_type = JPEG_CONTENT_TYPE
+        else:
+            waveform, _file = self._raw_ecg_waveform(ecg)
+            assert self.adapter is not None
+            data = self.adapter.render_waveform(waveform)
+            content_type = "image/png"
+        audit("ECG_INLINE_VISUAL_VIEWED", "ecg", str(ecg.ecg_uuid), organization_id=ecg.organization_id,
+              metadata={"source_kind": "image" if self._is_image_only_file(file) else "rendered_waveform"})
+        self.session.commit()
+        return data, content_type
+
     def ecg_security(self, ecg_uuid: str) -> dict[str, Any]:
         """Return the true storage-security posture for an authorized ECG asset."""
         ecg = self._ecg(ecg_uuid)
@@ -728,15 +1211,20 @@ class ClinicalService:
                 "tenant_scoped": True,
                 "server_side_rbac": True,
                 "audited": True,
+                "original_ecg_requires_role": ORIGINAL_ECG_VIEW_ROLE,
+                "original_ecg_available_to_current_user": self.can_view_original_ecg,
+                "protected_preview_available": True,
             },
             "research_camouflage": {
                 "used": False,
-                "reason": "Adversarial waveform camouflage is not encryption and is not used for clinical ECG records.",
+                "reason": "Adversarial waveform camouflage is not encryption and is not used for clinical ECG records. "
+                          "The protected preview is a non-signal redaction, not a camouflage transform.",
             },
         }
 
     def download_ecg(self, ecg_uuid: str) -> tuple[bytes, ECGFile]:
         ecg = self._ecg(ecg_uuid)
+        self._require_original_ecg_view(ecg)
         file = self._file_for_ecg(ecg)
         data = self.storage.get_bytes(file.object_key)
         if hashlib.sha256(data).hexdigest() != file.sha256:
@@ -744,6 +1232,18 @@ class ClinicalService:
         audit("ECG_VIEWED", "ecg_file", str(file.ecg_file_id), organization_id=ecg.organization_id)
         self.session.commit()
         return data, file
+
+    def download_ecg_url(self, ecg_uuid: str) -> tuple[ECGRecord, str | None]:
+        """Issue a direct-object URL only after the literal doctor-role check."""
+        ecg = self._ecg(ecg_uuid)
+        self._require_original_ecg_view(ecg)
+        file = self._file_for_ecg(ecg)
+        signed = self.storage.presigned_get(file.object_key)
+        audit("ECG_DOWNLOAD_URL_ISSUED", "ecg_file", str(file.ecg_file_id),
+              organization_id=ecg.organization_id,
+              metadata={"storage_redirect": bool(signed)})
+        self.session.commit()
+        return ecg, signed
 
     def _raw_ecg_waveform(self, ecg: ECGRecord) -> tuple[Any, ECGFile]:
         file = self._file_for_ecg(ecg)
@@ -759,6 +1259,7 @@ class ClinicalService:
     def waveform_data(self, ecg_uuid: str) -> dict[str, Any]:
         """Return the actual authorized single-lead data for the web viewer."""
         ecg = self._ecg(ecg_uuid)
+        self._require_ecg_visual_access(ecg)
         waveform, _file = self._raw_ecg_waveform(ecg)
         audit("ECG_WAVEFORM_VIEWED", "ecg", str(ecg.ecg_uuid), organization_id=ecg.organization_id,
               metadata={"sampling_rate_hz": ecg.sampling_rate, "sample_count": int(waveform.size)})
@@ -769,6 +1270,7 @@ class ClinicalService:
 
     def waveform_png(self, ecg: ECGRecord) -> bytes:
         """Create a non-persistent waveform rendering for an authorized report."""
+        self._require_original_ecg_view(ecg)
         waveform, _file = self._raw_ecg_waveform(ecg)
         assert self.adapter is not None
         return self.adapter.render_waveform(waveform)
@@ -925,6 +1427,11 @@ class ClinicalService:
 
     def explanation_bytes(self, ecg_uuid: str) -> bytes:
         ecg = self._ecg(ecg_uuid)
+        # Grad-CAM includes a plotted normalized source trace. It is not safe
+        # to treat that rendering as less sensitive than the original ECG. A
+        # doctor-approved visual grant may view it inline, but cannot export a
+        # raw source file or waveform-bearing PDF.
+        self._require_ecg_visual_access(ecg)
         analysis = self.session.scalar(select(AIAnalysis).where(AIAnalysis.ecg_uuid == ecg.ecg_uuid,
                                                                   AIAnalysis.status == "COMPLETED")
                                        .order_by(AIAnalysis.created_at.desc()))
@@ -1052,6 +1559,10 @@ class ClinicalService:
         from .reports import build_ecg_report_pdf
 
         report, ecg, patient, membership = self._report_context(report_uuid)
+        # Generated reports embed ``waveform_png`` below; enforce the role
+        # boundary here as well as at the route so a service caller cannot
+        # create a waveform-bearing document for a non-doctor principal.
+        self._require_original_ecg_view(ecg)
         organization = self.session.get(Organization, ecg.organization_id)
         analysis = self.session.scalar(select(AIAnalysis).where(AIAnalysis.ecg_uuid == ecg.ecg_uuid,
                                                                   AIAnalysis.status == "COMPLETED")
@@ -1107,6 +1618,9 @@ class ClinicalService:
 
     def download_report(self, report_uuid: str) -> tuple[bytes, ReportDocument]:
         report, ecg, _patient, _membership = self._report_context(report_uuid)
+        # A stored report contains an original waveform rendering, so serving
+        # its bytes would otherwise bypass the direct ECG-view restriction.
+        self._require_original_ecg_view(ecg)
         document = self.session.scalar(select(ReportDocument).where(ReportDocument.report_uuid == report.report_uuid)
                                        .order_by(ReportDocument.created_at.desc()))
         if document is None:

@@ -139,6 +139,55 @@ export interface EcgWaveform {
   samples: number[];
 }
 
+/**
+ * A doctor-approved, short-lived credential used only to render one ECG in the
+ * current browser memory. It is never stored in localStorage or sessionStorage.
+ */
+export interface EcgVisualAccessGrant {
+  access_token: string;
+  ecg_id?: Identifier;
+  ecg_uuid?: Identifier;
+  request_id?: Identifier;
+  request_uuid?: Identifier;
+  expires_at: string;
+}
+
+/** Status returned to a requester before, during, or after doctor approval. */
+export interface EcgVisualAccessStatus {
+  ecg_id?: Identifier;
+  ecg_uuid?: Identifier;
+  request_id?: Identifier;
+  request_uuid?: Identifier;
+  status?: "PENDING" | "APPROVED" | "UNLOCKED" | "EXPIRED" | "DENIED" | "REVOKED" | "LOCKED" | string;
+  requested_at?: string;
+  approved_at?: string;
+  expires_at?: string;
+  passcode_expires_at?: string;
+  access_expires_at?: string;
+  requester_name?: string;
+  requester_email?: string;
+  requester_role?: string;
+  requester?: {
+    user_id?: Identifier;
+    display_name?: string;
+  };
+  [key: string]: unknown;
+}
+
+/** A pending/requested ECG visual-access item visible to a literal doctor. */
+export interface EcgVisualAccessRequest extends EcgVisualAccessStatus {
+  id?: Identifier;
+  patient_id?: Identifier;
+  patient_uuid?: Identifier;
+  filename?: string;
+  source_filename?: string;
+}
+
+/** One-time passcode response shown only to the approving doctor. */
+export interface EcgVisualAccessApproval extends EcgVisualAccessStatus {
+  passcode: string;
+}
+
 export interface EcgSecurityStatus {
   ecg_uuid: Identifier;
   storage: {

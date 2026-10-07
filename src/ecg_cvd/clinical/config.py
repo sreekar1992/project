@@ -30,6 +30,10 @@ class Settings:
     flask_secret: str
     access_token_minutes: int
     refresh_token_days: int
+    visual_access_request_hours: int
+    visual_access_passcode_minutes: int
+    visual_access_session_minutes: int
+    visual_access_max_attempts: int
     object_storage_backend: str
     local_object_storage_path: Path
     local_asset_encryption_key_path: Path
@@ -92,6 +96,17 @@ class Settings:
                                      or os.getenv("ACCESS_TOKEN_MINUTES", "15")),
             refresh_token_days=int(overrides.get("REFRESH_TOKEN_DAYS")
                                    or os.getenv("REFRESH_TOKEN_DAYS", "7")),
+            # These are deliberately short-lived, server-enforced limits for
+            # doctor-approved, visual-only ECG access grants.  They are not
+            # credentials for object storage or a replacement for RBAC.
+            visual_access_request_hours=int(overrides.get("VISUAL_ACCESS_REQUEST_HOURS")
+                                            or os.getenv("VISUAL_ACCESS_REQUEST_HOURS", "24")),
+            visual_access_passcode_minutes=int(overrides.get("VISUAL_ACCESS_PASSCODE_MINUTES")
+                                               or os.getenv("VISUAL_ACCESS_PASSCODE_MINUTES", "15")),
+            visual_access_session_minutes=int(overrides.get("VISUAL_ACCESS_SESSION_MINUTES")
+                                              or os.getenv("VISUAL_ACCESS_SESSION_MINUTES", "10")),
+            visual_access_max_attempts=int(overrides.get("VISUAL_ACCESS_MAX_ATTEMPTS")
+                                           or os.getenv("VISUAL_ACCESS_MAX_ATTEMPTS", "5")),
             object_storage_backend=storage_backend,
             local_object_storage_path=Path(overrides.get("LOCAL_OBJECT_STORAGE_PATH")
                                            or os.getenv("LOCAL_OBJECT_STORAGE_PATH")

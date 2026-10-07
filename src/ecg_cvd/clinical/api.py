@@ -19,9 +19,10 @@ from .models import (AIAnalysis, AIModel, AIModelVersion, Condition, DiagnosticR
                      Encounter, Feature, Organization, PatientContact, PatientIdentifier, Practitioner,
                      Prescription, PrescriptionItem, ReportDocument, User)
 from .schemas import (EncounterRequest, FeatureRequest, ImageDigitizationRequest, LoginRequest,
-                      OrganizationRequest, PatientMatchRequest, PatientRequest, ReviewRequest, UserRequest)
+                      OrganizationRequest, PatientMatchRequest, PatientRequest, ReviewRequest, UserRequest,
+                      VisualAccessUnlockRequest)
 from .security import (APIError, audit, current_principal, issue_token_pair, password_matches,
-                       require_any_permission, require_permission, revoke_refresh_token, settings,
+                       require_any_permission, require_permission, require_role, revoke_refresh_token, settings,
                        user_from_refresh_token)
 from .services import ClinicalService, as_uuid
 
@@ -361,6 +362,25 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
             raise APIError("PATIENT_REQUIRED", "patient_id is required.", 400)
         return jsonify([_ecg_response(row) for row in ClinicalService(current_principal()).list_ecgs(patient_id)])
 
+    @api.get("/ecgs/visual-access-requests")
+    @require_role("DOCTOR")
+    def list_visual_access_requests():
+        """Doctor inbox for same-tenant original-ECG visual access requests."""
+        return jsonify(items=ClinicalService(current_principal()).list_visual_access_requests(
+            request.args.get("status"),
+        ))
+
+    @api.post("/ecgs/visual-access-requests/<request_id>/approve")
+    @require_role("DOCTOR")
+    def approve_visual_access_request(request_id: str):
+        """Generate and return a one-time passcode to the approving doctor."""
+        return jsonify(ClinicalService(current_principal()).approve_visual_access_request(request_id))
+
+    @api.post("/ecgs/visual-access-requests/<request_id>/revoke")
+    @require_role("DOCTOR")
+    def revoke_visual_access_request(request_id: str):
+        return jsonify(ClinicalService(current_principal()).revoke_visual_access_request(request_id))
+
     @api.post("/ecgs")
     @api.post("/ecgs/upload")
     @require_permission("ecg.upload")
@@ -386,8 +406,28 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
     def get_ecg(ecg_id: str):
         return jsonify(_ecg_response(ClinicalService(current_principal()).get_ecg(ecg_id)))
 
+    @api.post("/ecgs/<ecg_id>/visual-access-requests")
+    @require_any_permission("ecg.read", "ecg.self.read")
+    def request_visual_access(ecg_id: str):
+        """Request doctor approval for one inline, original ECG visual."""
+        return jsonify(ClinicalService(current_principal()).request_visual_access(ecg_id)), 201
+
+    @api.get("/ecgs/<ecg_id>/visual-access-grant")
+    @require_any_permission("ecg.read", "ecg.self.read")
+    def current_visual_access_grant(ecg_id: str):
+        return jsonify(grant=ClinicalService(current_principal()).current_visual_access_grant(ecg_id))
+
+    @api.post("/ecgs/<ecg_id>/visual-access-requests/<request_id>/unlock")
+    @limiter.limit("5 per minute")
+    @require_any_permission("ecg.read", "ecg.self.read")
+    def unlock_visual_access_request(ecg_id: str, request_id: str):
+        return jsonify(ClinicalService(current_principal()).unlock_visual_access_request(
+            request_id, _body(VisualAccessUnlockRequest).passcode, expected_ecg_uuid=ecg_id,
+        ))
+
     @api.get("/ecgs/<ecg_id>/file")
     @require_any_permission("ecg.read", "ecg.self.read")
+    @require_role("DOCTOR")
     def download_ecg(ecg_id: str):
         data, asset = ClinicalService(current_principal()).download_ecg(ecg_id)
         return send_file(BytesIO(data), mimetype=asset.content_type, as_attachment=True,
@@ -398,6 +438,20 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
     def waveform_data(ecg_id: str):
         return jsonify(ClinicalService(current_principal()).waveform_data(ecg_id))
 
+    @api.get("/ecgs/<ecg_id>/protected-preview.png")
+    @require_any_permission("ecg.read", "ecg.self.read")
+    def protected_ecg_preview(ecg_id: str):
+        """Serve a static, non-signal blur for an otherwise authorized viewer."""
+        data = ClinicalService(current_principal()).protected_preview(ecg_id)
+        return Response(data, mimetype="image/png", headers={"Content-Disposition": "inline"})
+
+    @api.get("/ecgs/<ecg_id>/visual-image")
+    @require_any_permission("ecg.read", "ecg.self.read")
+    def visual_image(ecg_id: str):
+        """Serve a doctor/grant-authorized visual without source-file export."""
+        data, content_type = ClinicalService(current_principal()).visual_image(ecg_id)
+        return Response(data, mimetype=content_type, headers={"Content-Disposition": "inline"})
+
     @api.get("/ecgs/<ecg_id>/security")
     @require_any_permission("ecg.read", "ecg.self.read")
     def ecg_security(ecg_id: str):
@@ -405,11 +459,10 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
 
     @api.get("/ecgs/<ecg_id>/download-url")
     @require_any_permission("ecg.read", "ecg.self.read")
+    @require_role("DOCTOR")
     def ecg_download_url(ecg_id: str):
         service = ClinicalService(current_principal())
-        ecg = service._ecg(ecg_id)
-        asset = service._file_for_ecg(ecg)
-        signed = service.storage.presigned_get(asset.object_key)
+        ecg, signed = service.download_ecg_url(ecg_id)
         return jsonify(url=signed or f"/api/v1/ecgs/{ecg.ecg_uuid}/file", expires_in_seconds=300 if signed else None)
 
     def _start_analysis(ecg_id: str):
@@ -483,6 +536,7 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
 
     @api.post("/ecgs/<ecg_id>/explain")
     @require_permission("ai.read")
+    @require_role("DOCTOR")
     def explain_ecg(ecg_id: str):
         # The actual Grad-CAM is persisted during the real analysis call.  This
         # route intentionally never manufactures an explanation on a label alone.
@@ -492,7 +546,7 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
         return jsonify(available=True, url=f"/api/v1/ecgs/{ecg_id}/explain.png", analysis=_analysis_response(result))
 
     @api.get("/ecgs/<ecg_id>/explain.png")
-    @require_permission("ai.read")
+    @require_any_permission("ai.read", "ecg.read", "ecg.self.read")
     def explanation_image(ecg_id: str):
         data = ClinicalService(current_principal()).explanation_bytes(ecg_id)
         return send_file(BytesIO(data), mimetype="image/png", max_age=0)
@@ -548,10 +602,11 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
         patient_id = request.args.get("patient_id")
         if not patient_id:
             raise APIError("PATIENT_REQUIRED", "patient_id is required.", 400)
+        service = ClinicalService(current_principal())
         values = []
-        for report in ClinicalService(current_principal()).list_reports(patient_id):
+        for report in service.list_reports(patient_id):
             record = _report_response(report)
-            if report["has_pdf"]:
+            if report["has_pdf"] and service.can_view_original_ecg:
                 record["download_url"] = f"/api/v1/reports/{report['report_uuid']}/download"
             values.append(record)
         return jsonify(values)
@@ -571,11 +626,13 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
 
     @api.post("/reports/<report_id>/generate-pdf")
     @require_permission("report.create")
+    @require_role("DOCTOR")
     def generate_report(report_id: str):
         return jsonify(ClinicalService(current_principal()).generate_report_pdf(report_id)), 201
 
     @api.get("/reports/<report_id>/download")
     @require_any_permission("report.download", "report.self.read")
+    @require_role("DOCTOR")
     def download_report(report_id: str):
         payload, asset = ClinicalService(current_principal()).download_report(report_id)
         return send_file(BytesIO(payload), mimetype=asset.content_type, as_attachment=True,

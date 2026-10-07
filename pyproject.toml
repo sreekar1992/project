@@ -17,9 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 export = ["onnx>=1.16,<2", "onnxscript>=0.2,<1"]
+research-cwt = ["PyWavelets>=1.6,<2"]
 
 [project.scripts]
 ecg-train = "ecg_cvd.train:main"
+ecg-train-cwt-mobilenetv2 = "ecg_cvd.train_cwt_mobilenetv2:main"
 ecg-predict = "ecg_cvd.predict:main"
 ecg-encrypt = "ecg_cvd.crypto:encrypt_main"
 ecg-decrypt = "ecg_cvd.crypto:decrypt_main"

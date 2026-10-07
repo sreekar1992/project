@@ -29,7 +29,8 @@ The service does not return raw tracebacks, private storage paths, or raw ECG by
 | Hospital administration | `GET, POST /admin/hospitals`; `GET, PATCH /admin/hospitals/{organization_id}`; `GET, POST /admin/users`; `GET, POST, PATCH /admin/features`; `GET /admin/ai-models`; `GET /admin/audit-logs` |
 | Patient identity | `POST /patients/matches`; `GET, POST /patients`; `GET /patients/{patient_id}`; `GET /patients/{patient_id}/identifiers` |
 | Encounters | `GET /encounters?patient_id=...`; `POST /encounters`; `GET /encounters/{encounter_id}`; `GET /patients/{patient_id}/encounters` |
-| ECG assets | `GET /ecgs?patient_id=...`; `POST /ecgs` or `/ecgs/upload`; `GET /ecgs/{ecg_id}`; `GET /ecgs/{ecg_id}/file`; `GET /ecgs/{ecg_id}/waveform`; `GET /ecgs/{ecg_id}/download-url`; `GET /ecgs/{ecg_id}/security`; `POST /ecgs/{ecg_id}/digitize` |
+| ECG assets | `GET /ecgs?patient_id=...`; `POST /ecgs` or `/ecgs/upload`; `GET /ecgs/{ecg_id}`; `GET /ecgs/{ecg_id}/protected-preview.png`; `GET /ecgs/{ecg_id}/visual-image`; `GET /ecgs/{ecg_id}/file`; `GET /ecgs/{ecg_id}/waveform`; `GET /ecgs/{ecg_id}/download-url`; `GET /ecgs/{ecg_id}/security`; `POST /ecgs/{ecg_id}/digitize` |
+| Doctor-approved visual access | `POST /ecgs/{ecg_id}/visual-access-requests`; `GET /ecgs/{ecg_id}/visual-access-grant`; `POST /ecgs/{ecg_id}/visual-access-requests/{request_id}/unlock`; doctor-only `GET /ecgs/visual-access-requests`, `POST /ecgs/visual-access-requests/{request_id}/approve`, and `POST /ecgs/visual-access-requests/{request_id}/revoke` |
 | AI analysis | `GET /ai/model-info`; `POST /ecgs/{ecg_id}/analyze` or `POST /analyses`; `GET /ecgs/{ecg_id}/analysis`; `GET /analyses?patient_id=...`; `GET /ecgs/{ecg_id}/assessment-suggestion`; `POST /ecgs/{ecg_id}/explain`; `GET /ecgs/{ecg_id}/explain.png` |
 | Medicine-name catalogue | `GET /medicines?query=<prefix>&limit=8` |
 | Clinician review | `POST /ecgs/{ecg_id}/review`; `POST /reviews`; `GET /reviews?patient_id=...` |
@@ -38,7 +39,13 @@ The service does not return raw tracebacks, private storage paths, or raw ECG by
 
 `POST /ecgs` needs an existing `encounter_id`/`encounter_uuid`, plus a `file` field. It accepts validated `.mat` and `.csv` waveform files, plus server-decoded `.jpg`/`.jpeg` source images. A JPEG is stored as an `IMAGE_ONLY` record (`source_kind: ECG_IMAGE`, `content_type: image/jpeg`) after magic-byte, decoder, and pixel-limit validation; the server does not trust the browser MIME type or filename alone. New local assets, including source images and derived files, use authenticated AES-256-GCM storage with a fresh nonce per object.
 
-An image-only record can be authorized for download and integrity/security inspection, but `GET /ecgs/{ecg_id}/waveform` and the normal AI-analysis routes return `409 ECG_IMAGE_ONLY`. The configured RAMNV2 model never receives the JPEG itself. The only image-to-model path is the explicit, confirmation-gated experimental endpoint described below.
+An image-only record can be inspected for security status. Its source-download
+and direct-object URL routes remain literal-`DOCTOR` operations; a valid scoped
+visual grant can render it inline through the separate visual endpoint but does
+not enable source-file export. `GET /ecgs/{ecg_id}/waveform` and the normal
+AI-analysis routes return `409 ECG_IMAGE_ONLY` for a JPEG source. The configured
+RAMNV2 model never receives the JPEG itself. The only image-to-model path is the
+explicit, confirmation-gated experimental endpoint described below.
 
 `GET /ai/model-info` is a read-only provenance endpoint for users with the `ecg.analyze` permission (normally doctors and technicians; the platform super administrator also has the wildcard permission). It reports the server-derived model name, version, framework, artifact fingerprint, preprocessing contract, and the JPEG image-only boundary without exposing the checkpoint's filesystem path. It reports configuration metadata, not clinical validation or treatment advice.
 
@@ -99,7 +106,86 @@ The endpoint runs one RAMNV2 analysis of the **derived numerical signal** before
 
 Analysis responses include the status, predicted label/name, uncalibrated confidence, top predictions, model version and artifact hash, timing, and whether a stored Grad-CAM image exists. They also include an explicit research/clinician-review safety statement. With asynchronous analysis enabled, creation returns `202`; otherwise it returns a completed result when inference succeeds.
 
-`GET /ecgs/{ecg_id}/waveform` returns the exact authorized, validated single-lead samples and acquisition metadata for the client-side viewer; it is audited and is not a public chart endpoint. The API supports authorized direct file downloads. S3-backed storage may instead return a short-lived presigned URL from `/download-url`; local storage is always streamed by Flask after authorization.
+## Original ECG visibility and doctor-approved visual grants
+
+Original ECG material is more restrictive than general platform administration.
+By default, only a principal with the literal `DOCTOR` role can access original
+ECG material. `SUPER_ADMIN` is intentionally not a bypass: platform-management
+permissions do not make an administrator a doctor for original-ECG access.
+Original files remain encrypted at rest with the configured AES-256-GCM storage
+implementation. The server holds the storage key; the clinical API exposes no
+shared or user-entered ECG decryption password. The legacy workbench's public
+demonstration password must not be used for clinical records.
+
+An otherwise authorized, non-doctor user can request one temporary **visual**
+view of one ECG. This is a distinct, server-enforced capability—not a general
+role elevation and not a source-file download grant.
+
+### Request → same-tenant doctor approval → one-time passcode → visual session
+
+1. The requester calls `POST /ecgs/{ecg_id}/visual-access-requests`. The
+   server resolves the ECG through normal tenant/patient authorization, binds
+   the request to that requester and ECG, assigns a server-side request expiry
+   and failed-attempt limit, and notifies active literal `DOCTOR` users in the
+   same tenant. A doctor cannot use this flow for a record outside that tenant.
+2. A literal same-tenant doctor reads the pending inbox at
+   `GET /ecgs/visual-access-requests?status=PENDING` and may approve with
+   `POST /ecgs/visual-access-requests/{request_id}/approve`, or revoke with
+   `POST /ecgs/visual-access-requests/{request_id}/revoke`. Approval returns a
+   random passcode **once** in that response. It must be delivered through an
+   approved out-of-band channel; it is not retained for later retrieval.
+3. The server records a random per-grant secret inside an AES-256-GCM password
+   envelope (using the project’s scrypt password derivation, fresh salt, and
+   fresh nonce). The envelope lets the server verify possession of the
+   passcode; it is not the ECG encryption key and does not contain the original
+   ECG. The envelope is cleared after unlock, expiry, revocation, or lockout.
+4. The requester submits the code to
+   `POST /ecgs/{ecg_id}/visual-access-requests/{request_id}/unlock` with
+   `{ "passcode": "..." }`. On success the server issues a short-lived,
+   signed `ECG-Visual-Grant` credential for the `X-ECG-Visual-Grant` header.
+   The grant is bound to the requester identity, exact ECG, tenant, request,
+   expiry, and a server-side hash of its token identifier. It cannot be reused
+   for another ECG or requester.
+
+The default server-side limits are a 24-hour pending request, 15-minute
+passcode, 10-minute visual session, and five failed passcode attempts; a
+deployment can configure these bounds. Expiry, revocation, lockout, and token
+validation are server decisions, not client-clock decisions. The server audits
+request creation, inbox reads, approval, denial, failed unlocks, successful
+unlocks, visual reads, and revocation; expiry and lockout status are evaluated
+and stored server-side.
+
+React keeps the passcode input and the resulting visual-grant credential in
+component memory only. Neither belongs in local storage, session storage,
+cookies, application logs, nor persisted browser state. A refresh, sign-out, or
+page teardown loses that browser credential even if the server-side grant has
+not yet expired.
+
+### Scope of the temporary grant
+
+The grant may be supplied only to the inline visual endpoints, such as
+`GET /ecgs/{ecg_id}/visual-image`, the scoped waveform visual, and the
+authorized inline Grad-CAM rendering. It does **not** authorize:
+
+- `GET /ecgs/{ecg_id}/file` or any original `.mat`, `.csv`, or JPEG download;
+- `GET /ecgs/{ecg_id}/download-url` or any presigned/direct object URL;
+- waveform-bearing PDF/report generation or report-download export; or
+- a permanent role, tenant, patient, or ECG access change.
+
+Those source-download, direct-object, and waveform-bearing report routes still
+require the literal `DOCTOR` role at the server boundary. The visual-grant
+header is never accepted as a substitute for that role check.
+
+Before approval, the React protected view uses a bundled static mosaic
+redaction and deliberately makes no source-image, waveform, Grad-CAM, or
+download request. `GET /ecgs/{ecg_id}/protected-preview.png` similarly returns
+a generic server-generated blurred redaction after normal scoped authorization;
+it never reads the ECG object store. Neither representation contains source
+pixels or waveform samples, or can be decrypted into a waveform. The static
+mosaic/redaction is an access-control display only: it is not encryption,
+ciphertext, an adversarial/camouflage transformation, or proof of protection
+against attacks. Browser lock/blur/mosaic UI is secondary to the server-side
+authorization checks.
 
 ## Compatibility and contract notes
 

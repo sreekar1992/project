@@ -83,7 +83,9 @@ def create_app(overrides: dict | None = None) -> Flask:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Vary"] = "Origin"
             response.headers["Access-Control-Allow-Credentials"] = "true"
-            response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Request-ID"
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Authorization, Content-Type, X-Request-ID, X-ECG-Visual-Grant"
+            )
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
         return response
 

@@ -85,8 +85,12 @@ metric.
    URI, checksum, metadata, and model-run records in the relational database.
 4. Require a clinician-authored review before a diagnosis, note, prescription,
    or report is treated as a clinical document.
-5. Keep model training, adversarial/camouflage experiments, and the Mendeley
-   research dataset in a separate research workflow from clinical records.
+5. Keep model training, true adversarial/camouflage experiments, and the
+   Mendeley research dataset in a separate research workflow from clinical
+   records. The clinical platform does not apply an adversarial perturbation
+   to a stored patient record as an access-control mechanism. Instead, it
+   keeps the original server-encrypted and gives non-doctor roles only a
+   generic, non-signal blurred redaction preview.
 
 ## Known limits carried into the platform
 

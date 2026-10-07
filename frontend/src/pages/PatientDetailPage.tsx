@@ -40,9 +40,11 @@ import { z } from "zod";
 import { ApiErrorAlert } from "../components/ApiErrorAlert";
 import { LoadingState } from "../components/LoadingState";
 import { EcgWaveformViewer } from "../components/EcgWaveformViewer";
+import { ProtectedEcgPreview } from "../components/ProtectedEcgPreview";
+import { DoctorVisualAccessInbox, VisualAccessRequestPanel, visualAccessEcgId, visualAccessRequestId } from "../components/VisualAccessControls";
 import { useAuth } from "../lib/auth";
-import { api } from "../lib/api";
-import { listFromResponse, patientDisplayName, type EcgDigitizationResult, type EcgRecord, type EcgSecurityStatus, type MedicineSuggestion } from "../types/api";
+import { api, hasCurrentVisualAccessGrant } from "../lib/api";
+import { listFromResponse, patientDisplayName, type EcgDigitizationResult, type EcgRecord, type EcgSecurityStatus, type EcgVisualAccessApproval, type EcgVisualAccessGrant, type EcgVisualAccessRequest, type MedicineSuggestion } from "../types/api";
 
 const encounterSchema = z.object({
   encounter_type: z.string().trim().min(1, "Choose an encounter type."),
@@ -208,8 +210,21 @@ function saveDownload(blob: Blob, filename: string): void {
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 }
 
-function GradCamViewer({ ecgId, onClose }: { ecgId: string; onClose: () => void }) {
-  const image = useQuery({ queryKey: ["gradcam", ecgId], queryFn: () => api.analyses.explanation(ecgId), staleTime: 5 * 60_000 });
+function GradCamViewer({
+  ecgId,
+  grant,
+  temporaryVisualAccess = false,
+  onClose,
+}: {
+  ecgId: string;
+  grant?: EcgVisualAccessGrant;
+  temporaryVisualAccess?: boolean;
+  onClose: () => void;
+}) {
+  // Never use the secret token in a query key. The query is removed when the
+  // temporary visual grant ends, and the API adds the grant header only after
+  // checking that it is bound to this ECG and still current.
+  const image = useQuery({ queryKey: ["gradcam", ecgId, grant?.expires_at ?? "doctor"], queryFn: () => api.analyses.explanation(ecgId, grant), staleTime: 0, gcTime: 0 });
   const [imageUrl, setImageUrl] = useState<string>();
 
   useEffect(() => {
@@ -226,7 +241,7 @@ function GradCamViewer({ ecgId, onClose }: { ecgId: string; onClose: () => void 
     <Paper sx={{ p: 2.5 }}>
       <Stack spacing={1.5}>
         <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
-          <Box><Typography variant="h6">Model-generated Grad-CAM</Typography><Typography variant="body2" color="text.secondary">Relevance visualization from the saved research analysis; it is not a diagnosis.</Typography></Box>
+          <Box><Typography variant="h6">Model-generated Grad-CAM</Typography><Typography variant="body2" color="text.secondary">{temporaryVisualAccess ? "Doctor-approved temporary visual access is active. This inline view expires automatically and cannot be downloaded." : "Relevance visualization from the saved research analysis; it is not a diagnosis."}</Typography></Box>
           <Button onClick={onClose} size="small">Hide</Button>
         </Stack>
         {image.isLoading && <LoadingState label="Loading authorized explanation…" />}
@@ -237,8 +252,23 @@ function GradCamViewer({ ecgId, onClose }: { ecgId: string; onClose: () => void 
   );
 }
 
-function AuthorizedEcgImageViewer({ ecgId, filename, onClose }: { ecgId: string; filename: string; onClose: () => void }) {
-  const image = useQuery({ queryKey: ["ecg-image", ecgId], queryFn: () => api.ecgs.download(ecgId), staleTime: 5 * 60_000 });
+function AuthorizedEcgImageViewer({
+  ecgId,
+  filename,
+  grant,
+  temporaryVisualAccess = false,
+  onClose,
+}: {
+  ecgId: string;
+  filename: string;
+  grant?: EcgVisualAccessGrant;
+  temporaryVisualAccess?: boolean;
+  onClose: () => void;
+}) {
+  // `/visual-image` is an inline-only endpoint. The original `/file` route is
+  // never used for temporary visual grants and remains a literal doctor-only
+  // download action.
+  const image = useQuery({ queryKey: ["ecg-image", ecgId, grant?.expires_at ?? "doctor"], queryFn: () => api.ecgs.visualImage(ecgId, grant), staleTime: 0, gcTime: 0 });
   const [imageUrl, setImageUrl] = useState<string>();
 
   useEffect(() => {
@@ -255,10 +285,10 @@ function AuthorizedEcgImageViewer({ ecgId, filename, onClose }: { ecgId: string;
     <Paper sx={{ p: 2.5 }}>
       <Stack spacing={1.5}>
         <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
-          <Box><Typography variant="h6">Authorized ECG image viewer</Typography><Typography variant="body2" color="text.secondary">{filename} is a securely stored source image for visual review. It is never sent directly to the raw-waveform AI model.</Typography></Box>
+          <Box><Typography variant="h6">{temporaryVisualAccess ? "Temporary doctor-approved ECG visual view" : "Doctor-authorized ECG image viewer"}</Typography><Typography variant="body2" color="text.secondary">{filename} is rendered through a protected inline visual endpoint. {temporaryVisualAccess ? `This view expires at ${formatDate(grant?.expires_at)}.` : "It is never sent directly to the raw-waveform AI model."}</Typography></Box>
           <Button onClick={onClose} size="small">Hide</Button>
         </Stack>
-        <Alert severity="info">JPEG ECG images can be reviewed and downloaded by authorized users. The explicit <strong>Convert &amp; analyze</strong> action can create a separately labelled experimental <strong>.mat</strong> or <strong>.csv</strong> derivative; it is not a clinically validated reconstruction.</Alert>
+        <Alert severity="info">{temporaryVisualAccess ? "This temporary grant is view-only. It does not allow source-file download, signed object URLs, report export, or permanent access." : "JPEG ECG images can be reviewed here by a doctor. Source-file download remains a separate doctor-only action."} The explicit <strong>Convert &amp; analyze</strong> action can create a separately labelled experimental <strong>.mat</strong> or <strong>.csv</strong> derivative; it is not a clinically validated reconstruction.</Alert>
         {image.isLoading && <LoadingState label="Loading authorized ECG image…" />}
         {image.isError && <ApiErrorAlert error={image.error} />}
         {imageUrl && <Box component="img" src={imageUrl} alt={`Authorized ECG image: ${filename}`} sx={{ display: "block", width: "100%", maxWidth: 1120, maxHeight: 900, objectFit: "contain", bgcolor: "#f7faf9", border: "1px solid #dce7e3", borderRadius: 1.5 }} />}
@@ -336,6 +366,12 @@ function MedicineAutocomplete({
 export function PatientDetailPage() {
   const { patientId = "" } = useParams();
   const { user } = useAuth();
+  const userRoles = user?.roles ?? (user?.role ? [user.role] : []);
+  // The direct visual-source policy is intentionally stricter than the
+  // platform's administrative roles: only a literal DOCTOR role gets normal
+  // waveform/file controls. A non-doctor can render a narrowly scoped,
+  // short-lived inline visual only after a server-approved grant.
+  const canViewOriginalEcg = userRoles.some((role) => role.toUpperCase() === "DOCTOR");
   const queryClient = useQueryClient();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadEncounter, setUploadEncounter] = useState("");
@@ -343,12 +379,19 @@ export function PatientDetailPage() {
   const [analysisEcg, setAnalysisEcg] = useState("");
   const [viewerEcgId, setViewerEcgId] = useState("");
   const [imageViewerEcgId, setImageViewerEcgId] = useState("");
+  const [protectedPreviewEcgId, setProtectedPreviewEcgId] = useState("");
   const [explanationEcgId, setExplanationEcgId] = useState("");
+  // View-only grant credentials intentionally live only in this component's
+  // React state. They are never written to localStorage, sessionStorage, URLs,
+  // query keys, or application logs.
+  const [visualAccessGrants, setVisualAccessGrants] = useState<Record<string, EcgVisualAccessGrant>>({});
+  const [grantClock, setGrantClock] = useState(() => Date.now());
+  const [visualAccessApproval, setVisualAccessApproval] = useState<EcgVisualAccessApproval>();
   const [digitizationEcgId, setDigitizationEcgId] = useState("");
   const [digitizationOutputFormat, setDigitizationOutputFormat] = useState<"csv" | "mat">("csv");
   const [confirmExperimentalDigitization, setConfirmExperimentalDigitization] = useState(false);
   const [recentDigitization, setRecentDigitization] = useState<EcgDigitizationResult | null>(null);
-  const securityEcgId = viewerEcgId || imageViewerEcgId;
+  const securityEcgId = viewerEcgId || imageViewerEcgId || protectedPreviewEcgId;
   // Keep the client affordance aligned with the server RBAC policy: the
   // platform-wide SUPER_ADMIN role has the wildcard permission that includes
   // `ecg.analyze`, while hospital administrators do not receive this clinical
@@ -365,8 +408,32 @@ export function PatientDetailPage() {
   const analyses = useQuery({ queryKey: ["analyses", patientId], queryFn: () => api.analyses.list(patientId), enabled: Boolean(patientId) });
   const reviews = useQuery({ queryKey: ["reviews", patientId], queryFn: () => api.reviews.list(patientId), enabled: Boolean(patientId) });
   const reports = useQuery({ queryKey: ["reports", patientId], queryFn: () => api.reports.list(patientId), enabled: Boolean(patientId) });
-  const waveform = useQuery({ queryKey: ["waveform", viewerEcgId], queryFn: () => api.ecgs.waveform(viewerEcgId), enabled: Boolean(viewerEcgId), staleTime: 5 * 60_000 });
+  const hasVisualGrantFor = (ecgId: string): boolean => hasCurrentVisualAccessGrant(visualAccessGrants[ecgId], ecgId, grantClock);
+  const canRenderOriginalFor = (ecgId: string): boolean => canViewOriginalEcg || hasVisualGrantFor(ecgId);
+  const waveform = useQuery({
+    queryKey: ["waveform", viewerEcgId],
+    queryFn: () => api.ecgs.waveform(viewerEcgId),
+    // Temporary grants render the server-side inline image instead of sending
+    // raw numerical waveform samples to a non-doctor browser.
+    enabled: canViewOriginalEcg && Boolean(viewerEcgId),
+    staleTime: 0,
+    gcTime: 0,
+  });
   const security = useQuery({ queryKey: ["ecg-security", securityEcgId], queryFn: () => api.ecgs.security(securityEcgId), enabled: Boolean(securityEcgId), staleTime: 5 * 60_000 });
+  const visualAccessStatus = useQuery({
+    queryKey: ["ecg-visual-access-status", protectedPreviewEcgId],
+    queryFn: () => api.ecgs.visualAccess.status(protectedPreviewEcgId),
+    enabled: !canViewOriginalEcg && Boolean(protectedPreviewEcgId),
+    refetchInterval: 10_000,
+    retry: false,
+  });
+  const doctorVisualAccessInbox = useQuery({
+    queryKey: ["doctor-visual-access-requests"],
+    queryFn: () => api.ecgs.visualAccess.inbox(),
+    enabled: canViewOriginalEcg,
+    refetchInterval: 10_000,
+    retry: false,
+  });
   const researchModel = useQuery({ queryKey: ["configured-research-model"], queryFn: api.researchModel, enabled: canUseResearchModel, staleTime: 5 * 60_000 });
   const encounterForm = useForm<EncounterValues>({ resolver: zodResolver(encounterSchema), defaultValues: { encounter_type: "", reason: "" } });
   const reviewForm = useForm<ReviewValues>({ resolver: zodResolver(reviewSchema), defaultValues: {
@@ -374,6 +441,41 @@ export function PatientDetailPage() {
     prescription_items: [],
   } });
   const prescriptionItems = useFieldArray({ control: reviewForm.control, name: "prescription_items" });
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setGrantClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    // A grant is meaningful only in the current patient workspace. Discard it
+    // rather than carrying any temporary credential across route changes.
+    setVisualAccessGrants({});
+    setVisualAccessApproval(undefined);
+  }, [patientId]);
+
+  useEffect(() => {
+    setVisualAccessGrants((current) => {
+      const active = Object.fromEntries(Object.entries(current).filter(([ecgId, grant]) => hasCurrentVisualAccessGrant(grant, ecgId, grantClock)));
+      return Object.keys(active).length === Object.keys(current).length ? current : active;
+    });
+  }, [grantClock]);
+
+  useEffect(() => {
+    const currentlyRenderedEcg = viewerEcgId || imageViewerEcgId || explanationEcgId;
+    if (!canViewOriginalEcg && currentlyRenderedEcg && !hasVisualGrantFor(currentlyRenderedEcg)) {
+      // A grant has expired or the account no longer has a valid visual-view
+      // session. Immediately unmount source-bearing components and discard
+      // their cached payloads before returning to the protected preview.
+      setProtectedPreviewEcgId(currentlyRenderedEcg);
+      setViewerEcgId("");
+      setImageViewerEcgId("");
+      setExplanationEcgId("");
+      queryClient.removeQueries({ queryKey: ["waveform"] });
+      queryClient.removeQueries({ queryKey: ["ecg-image"] });
+      queryClient.removeQueries({ queryKey: ["gradcam"] });
+    }
+  }, [canViewOriginalEcg, explanationEcgId, grantClock, imageViewerEcgId, queryClient, viewerEcgId, visualAccessGrants]);
 
   const createEncounter = useMutation({
     mutationFn: (values: EncounterValues) => api.encounters.create({ ...values, patient_id: patientId }),
@@ -390,11 +492,18 @@ export function PatientDetailPage() {
     onSuccess: (record) => {
       queryClient.invalidateQueries({ queryKey: ["ecgs", patientId] });
       setRecentUpload(record);
-      if (isEcgImage(record)) {
+      if (!canViewOriginalEcg) {
+        setProtectedPreviewEcgId(record.id);
+        setAnalysisEcg("");
+        setViewerEcgId("");
+        setImageViewerEcgId("");
+      } else if (isEcgImage(record)) {
+        setProtectedPreviewEcgId("");
         setAnalysisEcg("");
         setViewerEcgId("");
         setImageViewerEcgId(record.id);
       } else {
+        setProtectedPreviewEcgId("");
         setAnalysisEcg(record.id);
         setViewerEcgId(record.id);
         setImageViewerEcgId("");
@@ -406,6 +515,38 @@ export function PatientDetailPage() {
   const requestAnalysis = useMutation({
     mutationFn: () => api.analyses.create({ ecg_id: analysisEcg }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["analyses", patientId] }),
+  });
+  const requestVisualAccess = useMutation({
+    mutationFn: (ecgId: string) => api.ecgs.visualAccess.request(ecgId),
+    onSuccess: (_result, ecgId) => {
+      queryClient.invalidateQueries({ queryKey: ["ecg-visual-access-status", ecgId] });
+      queryClient.invalidateQueries({ queryKey: ["doctor-visual-access-requests"] });
+    },
+  });
+  const unlockVisualAccess = useMutation({
+    mutationFn: (values: { ecgId: string; requestId: string; passcode: string }) => api.ecgs.visualAccess.unlock(values.ecgId, values.requestId, values.passcode),
+    onSuccess: (grant, values) => {
+      // Bind the credential to the selected ECG locally as an additional
+      // client-side guard. The API independently binds/verifies it server-side.
+      const boundGrant: EcgVisualAccessGrant = { ...grant, ecg_id: values.ecgId };
+      setVisualAccessGrants((current) => ({ ...current, [values.ecgId]: boundGrant }));
+      queryClient.invalidateQueries({ queryKey: ["ecg-visual-access-status", values.ecgId] });
+      setProtectedPreviewEcgId("");
+      setExplanationEcgId("");
+      // A grant is intentionally visual-only: use the server's inline image
+      // renderer for both JPEG and numerical ECG records. Do not expose raw
+      // waveform samples, downloads, signed URLs, or report bytes.
+      setViewerEcgId("");
+      setImageViewerEcgId(values.ecgId);
+    },
+  });
+  const approveVisualAccess = useMutation({
+    mutationFn: (requestId: string) => api.ecgs.visualAccess.approve(requestId),
+    onSuccess: (approval) => {
+      setVisualAccessApproval(approval);
+      queryClient.invalidateQueries({ queryKey: ["doctor-visual-access-requests"] });
+      queryClient.invalidateQueries({ queryKey: ["ecg-visual-access-status"] });
+    },
   });
   const insertResearchAssessment = useMutation({
     mutationFn: (ecgId: string) => api.analyses.assessmentSuggestion(ecgId),
@@ -429,8 +570,9 @@ export function PatientDetailPage() {
       queryClient.invalidateQueries({ queryKey: ["ecg-security", result.derived_ecg.id] });
       setRecentDigitization(result);
       setAnalysisEcg(result.derived_ecg.id);
-      setViewerEcgId(result.derived_ecg.id);
+      setViewerEcgId(canViewOriginalEcg ? result.derived_ecg.id : "");
       setImageViewerEcgId("");
+      setProtectedPreviewEcgId(canViewOriginalEcg ? "" : result.derived_ecg.id);
       setDigitizationEcgId("");
       setConfirmExperimentalDigitization(false);
     },
@@ -485,10 +627,26 @@ export function PatientDetailPage() {
   const selectedReviewAnalysis = analysisItems.find((analysis) => analysis.id === reviewForm.watch("analysis_id"));
   const reviewItems = listFromResponse(reviews.data ?? []);
   const reportItems = listFromResponse(reports.data ?? []);
+  const patientEcgIds = new Set(ecgItems.map((ecg) => ecg.id));
+  const doctorVisualRequests = listFromResponse<EcgVisualAccessRequest>(doctorVisualAccessInbox.data ?? [])
+    .filter((request) => {
+      const requestedEcgId = visualAccessEcgId(request);
+      return requestedEcgId ? patientEcgIds.has(requestedEcgId) : false;
+    })
+    .map((request) => {
+      const requestEcgId = visualAccessEcgId(request);
+      const matchedRecord = requestEcgId ? ecgItems.find((ecg) => ecg.id === requestEcgId) : undefined;
+      return matchedRecord && !request.filename ? { ...request, filename: ecgFilename(matchedRecord) } : request;
+    });
   const viewedEcg = ecgItems.find((ecg) => ecg.id === viewerEcgId);
   const activeViewedEcg = viewedEcg ?? (recentDigitization?.derived_ecg.id === viewerEcgId ? recentDigitization.derived_ecg : undefined);
   const viewedEcgIsDigitized = isDigitizedEcg(activeViewedEcg ?? {});
-  const viewedImageEcg = ecgItems.find((ecg) => ecg.id === imageViewerEcgId);
+  const viewedImageEcg = ecgItems.find((ecg) => ecg.id === imageViewerEcgId)
+    ?? (recentDigitization?.derived_ecg.id === imageViewerEcgId ? recentDigitization.derived_ecg : undefined)
+    ?? (recentUpload?.id === imageViewerEcgId ? recentUpload : undefined);
+  const protectedPreviewEcg = ecgItems.find((ecg) => ecg.id === protectedPreviewEcgId)
+    ?? (recentDigitization?.derived_ecg.id === protectedPreviewEcgId ? recentDigitization.derived_ecg : undefined)
+    ?? (recentUpload?.id === protectedPreviewEcgId ? recentUpload : undefined);
   const digitizationSourceEcg = ecgItems.find((ecg) => ecg.id === digitizationEcgId);
   const waveformEcgItems = ecgItems.filter((ecg) => !isEcgImage(ecg));
   const selectedFileIsImage = /\.(jpe?g)$/i.test(selectedFile?.name ?? "");
@@ -562,6 +720,8 @@ export function PatientDetailPage() {
           <Stack divider={<Divider flexItem />}>
             {ecgItems.map((ecg) => {
               const isImage = isEcgImage(ecg);
+              const canRenderThisEcg = canRenderOriginalFor(ecg.id);
+              const temporaryGrant = visualAccessGrants[ecg.id];
               return (
                 <Box key={ecg.id} sx={{ p: 2.5, display: "flex", gap: 2, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" }}>
                   <Box sx={{ minWidth: 0, flex: "1 1 250px" }}>
@@ -573,12 +733,20 @@ export function PatientDetailPage() {
                     <Typography variant="body2" color="text.secondary">Uploaded/acquired: {formatDate(ecg.acquired_at ?? ecg.created_at)} · Status: {ecg.status ?? "unknown"}</Typography>
                     {isImage && <Typography variant="caption" color="text.secondary">This source image is never sent directly to RAMNV2. An authorized user may explicitly create a separate experimental numerical derivative.</Typography>}
                     {isDigitizedEcg(ecg) && <Typography variant="caption" color="warning.dark">Derived from a JPEG trace extraction. Treat waveform and score as research artifacts requiring clinician review.</Typography>}
+                    {!canViewOriginalEcg && !canRenderThisEcg && <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.4 }}>Original ECG pixels and waveform values are locked for this role. Only a non-clinical protected camouflage preview is available until a doctor approves a temporary visual grant.</Typography>}
+                    {!canViewOriginalEcg && canRenderThisEcg && <Typography variant="caption" color="success.dark" sx={{ display: "block", mt: 0.4 }}>Temporary doctor-approved visual access is active until {formatDate(temporaryGrant?.expires_at)}. It is view-only and cannot be downloaded.</Typography>}
                   </Box>
                   <RecordingSecurityStatus ecgId={ecg.id} />
                   <Stack direction="row" spacing={1}>
-                    {isImage
-                      ? <Button onClick={() => { setImageViewerEcgId(ecg.id); setViewerEcgId(""); }} size="small" startIcon={<ImageOutlinedIcon />}>View image</Button>
-                      : <Button onClick={() => { setViewerEcgId(ecg.id); setImageViewerEcgId(""); }} size="small">View waveform</Button>}
+                    {canViewOriginalEcg ? (
+                      isImage
+                        ? <Button onClick={() => { setImageViewerEcgId(ecg.id); setViewerEcgId(""); setProtectedPreviewEcgId(""); }} size="small" startIcon={<ImageOutlinedIcon />}>View image</Button>
+                        : <Button onClick={() => { setViewerEcgId(ecg.id); setImageViewerEcgId(""); setProtectedPreviewEcgId(""); }} size="small">View waveform</Button>
+                    ) : canRenderThisEcg ? (
+                      <Button onClick={() => { setImageViewerEcgId(ecg.id); setViewerEcgId(""); setProtectedPreviewEcgId(""); setExplanationEcgId(""); }} size="small" color="success" startIcon={<ImageOutlinedIcon />}>Open temporary visual view</Button>
+                    ) : (
+                      <Button onClick={() => { setProtectedPreviewEcgId(ecg.id); setViewerEcgId(""); setImageViewerEcgId(""); setExplanationEcgId(""); }} size="small" startIcon={<SecurityOutlinedIcon />}>View protected preview</Button>
+                    )}
                     {isImage && canUseResearchModel && (
                       <Button
                         size="small"
@@ -595,9 +763,11 @@ export function PatientDetailPage() {
                         Convert &amp; analyze
                       </Button>
                     )}
-                    <Button onClick={() => downloadEcg.mutate(ecg)} disabled={downloadEcg.isPending} size="small">
-                      {downloadEcg.isPending ? "Preparing download…" : "Download source file"}
-                    </Button>
+                    {canViewOriginalEcg ? (
+                      <Button onClick={() => downloadEcg.mutate(ecg)} disabled={downloadEcg.isPending} size="small">
+                        {downloadEcg.isPending ? "Preparing download…" : "Download source file"}
+                      </Button>
+                    ) : <Chip size="small" icon={<SecurityOutlinedIcon />} label="Source download locked" variant="outlined" />}
                   </Stack>
                 </Box>
               );
@@ -606,6 +776,22 @@ export function PatientDetailPage() {
           </Stack>
         )}
       </Paper>
+
+      {canViewOriginalEcg && (
+        <DoctorVisualAccessInbox
+          requests={doctorVisualRequests}
+          isLoading={doctorVisualAccessInbox.isLoading}
+          error={doctorVisualAccessInbox.error}
+          approvingRequestId={approveVisualAccess.isPending ? approveVisualAccess.variables : undefined}
+          approval={visualAccessApproval}
+          approvalError={approveVisualAccess.error}
+          onApprove={(requestId) => {
+            setVisualAccessApproval(undefined);
+            approveVisualAccess.mutate(requestId);
+          }}
+          onDismissApproval={() => setVisualAccessApproval(undefined)}
+        />
+      )}
 
       <Dialog
         open={Boolean(digitizationEcgId)}
@@ -684,36 +870,94 @@ export function PatientDetailPage() {
             )}
             <Typography variant="caption" color="text.secondary">{recentDigitization.digitization.limitations}</Typography>
             <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-              <Button size="small" onClick={() => setViewerEcgId(recentDigitization.derived_ecg.id)}>View derived waveform</Button>
-              <Button size="small" onClick={() => setExplanationEcgId(recentDigitization.derived_ecg.id)} disabled={!recentDigitization.analysis.has_explanation}>View Grad-CAM</Button>
+              {canViewOriginalEcg ? (
+                <>
+                  <Button size="small" onClick={() => { setViewerEcgId(recentDigitization.derived_ecg.id); setProtectedPreviewEcgId(""); }}>View derived waveform</Button>
+                  <Button size="small" onClick={() => setExplanationEcgId(recentDigitization.derived_ecg.id)} disabled={!recentDigitization.analysis.has_explanation}>View Grad-CAM</Button>
+                </>
+              ) : canRenderOriginalFor(recentDigitization.derived_ecg.id) ? (
+                <>
+                  <Button size="small" color="success" startIcon={<ImageOutlinedIcon />} onClick={() => { setImageViewerEcgId(recentDigitization.derived_ecg.id); setViewerEcgId(""); setProtectedPreviewEcgId(""); }}>Open temporary visual view</Button>
+                  {recentDigitization.analysis.has_explanation && <Button size="small" color="success" onClick={() => setExplanationEcgId(recentDigitization.derived_ecg.id)}>View temporary Grad-CAM</Button>}
+                </>
+              ) : <Button size="small" startIcon={<SecurityOutlinedIcon />} onClick={() => setProtectedPreviewEcgId(recentDigitization.derived_ecg.id)}>View protected preview</Button>}
             </Stack>
           </Stack>
         </Paper>
       )}
 
-      {viewerEcgId && (
-        <Paper sx={{ p: 2.5 }}>
-          <Stack spacing={1.5}>
-            <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
-              <Box>
-                <Typography variant="h6">{viewedEcgIsDigitized ? "Experimental derived ECG viewer" : "Authorized ECG viewer"}</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  {viewedEcgIsDigitized
-                    ? `This numerical waveform was estimated from ${activeViewedEcg ? ecgFilename(activeViewedEcg) : "a JPEG ECG source image"}. It is not the original device acquisition and is shown for research review only.`
-                    : `Single-lead source waveform from ${activeViewedEcg ? ecgFilename(activeViewedEcg) : "the selected recording"}. Zoom and pan happen only in this browser session.`}
-                </Typography>
-              </Box>
-              <Button onClick={() => setViewerEcgId("")} size="small">Hide</Button>
+      {viewerEcgId && canRenderOriginalFor(viewerEcgId) && (
+        canViewOriginalEcg ? (
+          <Paper sx={{ p: 2.5 }}>
+            <Stack spacing={1.5}>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
+                <Box>
+                  <Typography variant="h6">{viewedEcgIsDigitized ? "Experimental derived ECG viewer" : "Doctor-authorized ECG viewer"}</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    {viewedEcgIsDigitized
+                      ? `This numerical waveform was estimated from ${activeViewedEcg ? ecgFilename(activeViewedEcg) : "a JPEG ECG source image"}. It is not the original device acquisition and is shown for research review only.`
+                      : `Single-lead source waveform from ${activeViewedEcg ? ecgFilename(activeViewedEcg) : "the selected recording"}. Zoom and pan happen only in this browser session.`}
+                  </Typography>
+                </Box>
+                <Button onClick={() => setViewerEcgId("")} size="small">Hide</Button>
+              </Stack>
+              {waveform.isLoading && <LoadingState label="Loading authorized waveform…" />}
+              {waveform.isError && <ApiErrorAlert error={waveform.error} />}
+              {waveform.data && <EcgWaveformViewer samples={waveform.data.samples} samplingRateHz={waveform.data.sampling_rate_hz} title={viewedEcgIsDigitized ? "Experimental JPEG-derived ECG waveform" : "Authorized single-lead ECG waveform"} />}
             </Stack>
-            {waveform.isLoading && <LoadingState label="Loading authorized waveform…" />}
-            {waveform.isError && <ApiErrorAlert error={waveform.error} />}
-            {waveform.data && <EcgWaveformViewer samples={waveform.data.samples} samplingRateHz={waveform.data.sampling_rate_hz} title={viewedEcgIsDigitized ? "Experimental JPEG-derived ECG waveform" : "Authorized single-lead ECG waveform"} />}
-          </Stack>
-        </Paper>
+          </Paper>
+        ) : (
+          <AuthorizedEcgImageViewer
+            ecgId={viewerEcgId}
+            filename={activeViewedEcg ? ecgFilename(activeViewedEcg) : "Selected ECG recording"}
+            grant={visualAccessGrants[viewerEcgId]}
+            temporaryVisualAccess
+            onClose={() => setViewerEcgId("")}
+          />
+        )
       )}
 
-      {imageViewerEcgId && viewedImageEcg && (
-        <AuthorizedEcgImageViewer ecgId={imageViewerEcgId} filename={ecgFilename(viewedImageEcg)} onClose={() => setImageViewerEcgId("")} />
+      {imageViewerEcgId && viewedImageEcg && canRenderOriginalFor(imageViewerEcgId) && (
+        <AuthorizedEcgImageViewer
+          ecgId={imageViewerEcgId}
+          filename={ecgFilename(viewedImageEcg)}
+          grant={canViewOriginalEcg ? undefined : visualAccessGrants[imageViewerEcgId]}
+          temporaryVisualAccess={!canViewOriginalEcg}
+          onClose={() => setImageViewerEcgId("")}
+        />
+      )}
+
+      {!canViewOriginalEcg && protectedPreviewEcgId && protectedPreviewEcg && (
+        <Stack spacing={2}>
+          <ProtectedEcgPreview
+            ecgId={protectedPreviewEcgId}
+            filename={ecgFilename(protectedPreviewEcg)}
+            security={security.data}
+            securityIsLoading={security.isLoading}
+            onClose={() => setProtectedPreviewEcgId("")}
+          />
+          <VisualAccessRequestPanel
+            status={visualAccessStatus.data ?? undefined}
+            isLoading={visualAccessStatus.isLoading}
+            statusError={visualAccessStatus.error}
+            requestPending={requestVisualAccess.isPending}
+            requestError={requestVisualAccess.error}
+            unlockPending={unlockVisualAccess.isPending}
+            unlockError={unlockVisualAccess.error}
+            onRequest={() => {
+              requestVisualAccess.reset();
+              unlockVisualAccess.reset();
+              requestVisualAccess.mutate(protectedPreviewEcgId);
+            }}
+            onUnlock={(passcode) => {
+              const requestId = visualAccessRequestId(visualAccessStatus.data ?? undefined);
+              if (!requestId) return;
+              unlockVisualAccess.reset();
+              unlockVisualAccess.mutate({ ecgId: protectedPreviewEcgId, requestId, passcode });
+            }}
+            onRefresh={() => { void visualAccessStatus.refetch(); }}
+          />
+        </Stack>
       )}
 
       {securityEcgId && (
@@ -784,6 +1028,7 @@ export function PatientDetailPage() {
               <Stack divider={<Divider flexItem />}>
                 {analysisItems.map((analysis) => {
                   const confidence = confidenceValue(analysis.confidence);
+                  const canRenderAnalysisVisual = Boolean(analysis.ecg_id && canRenderOriginalFor(analysis.ecg_id));
                   return (
                     <Box key={analysis.id} sx={{ p: 2.5 }}>
                       <Stack direction="row" justifyContent="space-between" gap={2} alignItems="flex-start">
@@ -798,8 +1043,11 @@ export function PatientDetailPage() {
                       </Stack>
                       {confidence !== undefined && <Box sx={{ mt: 1.5 }}><Stack direction="row" justifyContent="space-between"><Typography variant="caption">Uncalibrated model score</Typography><Typography variant="caption">{confidence}%</Typography></Stack><LinearProgress variant="determinate" value={confidence} sx={{ mt: 0.5, height: 7, borderRadius: 10 }} /></Box>}
                       <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
-                        {analysis.ecg_id && <Button size="small" onClick={() => setViewerEcgId(analysis.ecg_id!)}>View waveform</Button>}
-                        {analysis.ecg_id && analysis.has_explanation && <Button size="small" onClick={() => setExplanationEcgId(analysis.ecg_id!)}>View Grad-CAM</Button>}
+                        {analysis.ecg_id && canViewOriginalEcg && <Button size="small" onClick={() => { setViewerEcgId(analysis.ecg_id!); setProtectedPreviewEcgId(""); }}>View waveform</Button>}
+                        {analysis.ecg_id && canViewOriginalEcg && analysis.has_explanation && <Button size="small" onClick={() => setExplanationEcgId(analysis.ecg_id!)}>View Grad-CAM</Button>}
+                        {analysis.ecg_id && !canViewOriginalEcg && canRenderAnalysisVisual && <Button size="small" color="success" startIcon={<ImageOutlinedIcon />} onClick={() => { setImageViewerEcgId(analysis.ecg_id!); setViewerEcgId(""); setProtectedPreviewEcgId(""); setExplanationEcgId(""); }}>Open temporary visual view</Button>}
+                        {analysis.ecg_id && !canViewOriginalEcg && canRenderAnalysisVisual && analysis.has_explanation && <Button size="small" color="success" onClick={() => setExplanationEcgId(analysis.ecg_id!)}>View temporary Grad-CAM</Button>}
+                        {analysis.ecg_id && !canViewOriginalEcg && !canRenderAnalysisVisual && <Button size="small" startIcon={<SecurityOutlinedIcon />} onClick={() => { setProtectedPreviewEcgId(analysis.ecg_id!); setViewerEcgId(""); setImageViewerEcgId(""); setExplanationEcgId(""); }}>View protected preview</Button>}
                       </Stack>
                     </Box>
                   );
@@ -811,7 +1059,7 @@ export function PatientDetailPage() {
         </Box>
       </Box>
 
-      {explanationEcgId && <GradCamViewer ecgId={explanationEcgId} onClose={() => setExplanationEcgId("")} />}
+      {explanationEcgId && canRenderOriginalFor(explanationEcgId) && <GradCamViewer ecgId={explanationEcgId} grant={canViewOriginalEcg ? undefined : visualAccessGrants[explanationEcgId]} temporaryVisualAccess={!canViewOriginalEcg} onClose={() => setExplanationEcgId("")} />}
 
       <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "repeat(2, minmax(0, 1fr))" }, gap: 3 }}>
         <Box>
@@ -933,7 +1181,7 @@ export function PatientDetailPage() {
               <Stack divider={<Divider flexItem />}>
                 {reviewItems.map((review) => <Box key={review.id} sx={{ p: 2.5 }}><Stack direction="row" justifyContent="space-between" gap={2}><Typography fontWeight={700}>{review.status ?? "Review recorded"}</Typography><Typography variant="caption" color="text.secondary">{formatDate(review.reviewed_at ?? review.created_at)}</Typography></Stack><Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>{review.clinician_notes ?? "No narrative review returned."}</Typography></Box>)}
                 {!reviewItems.length && <Box sx={{ p: 2.5 }}><Typography color="text.secondary">No clinician reviews were returned.</Typography></Box>}
-                {reports.isError ? <ResourceError error={reports.error} /> : reportItems.map((report) => <Box key={report.id} sx={{ p: 2.5, borderTop: "1px solid #dce7e3" }}><Stack direction="row" justifyContent="space-between" alignItems="center" gap={2}><Box><Typography fontWeight={700}>{report.title ?? "Clinical report"}</Typography><Typography variant="body2" color="text.secondary">{report.status ?? "available"} · {formatDate(report.created_at)}</Typography></Box>{report.download_url ? <Button onClick={() => downloadReport.mutate(report)} disabled={downloadReport.isPending} size="small">{downloadReport.isPending ? "Preparing…" : "Download authorized PDF"}</Button> : <Button onClick={() => generateReport.mutate(report.id)} disabled={generateReport.isPending} size="small">{generateReport.isPending ? "Generating…" : "Generate PDF"}</Button>}</Stack></Box>)}
+                {reports.isError ? <ResourceError error={reports.error} /> : reportItems.map((report) => <Box key={report.id} sx={{ p: 2.5, borderTop: "1px solid #dce7e3" }}><Stack direction="row" justifyContent="space-between" alignItems="center" gap={2}><Box><Typography fontWeight={700}>{report.title ?? "Clinical report"}</Typography><Typography variant="body2" color="text.secondary">{report.status ?? "available"} · {formatDate(report.created_at)}</Typography></Box>{canViewOriginalEcg ? (report.download_url ? <Button onClick={() => downloadReport.mutate(report)} disabled={downloadReport.isPending} size="small">{downloadReport.isPending ? "Preparing…" : "Download authorized PDF"}</Button> : <Button onClick={() => generateReport.mutate(report.id)} disabled={generateReport.isPending} size="small">{generateReport.isPending ? "Generating…" : "Generate PDF"}</Button>) : <Chip size="small" icon={<SecurityOutlinedIcon />} label="Waveform-bearing PDF locked" variant="outlined" />}</Stack></Box>)}
                 {generateReport.isError && <ResourceError error={generateReport.error} />}
                 {downloadReport.isError && <ResourceError error={downloadReport.error} />}
               </Stack>

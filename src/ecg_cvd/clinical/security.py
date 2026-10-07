@@ -84,6 +84,57 @@ def issue_token_pair(user: User) -> dict[str, object]:
                      "roles": sorted(principal.roles)}}
 
 
+def issue_ecg_visual_access_token(*, user_id: uuid.UUID, ecg_id: uuid.UUID,
+                                  grant_id: uuid.UUID, expires_at: datetime) -> tuple[str, str]:
+    """Issue a signed, short-lived token for exactly one inline ECG visual.
+
+    The caller persists only a hash of the returned JTI.  This means a grant
+    revocation or a later successful unlock invalidates an older browser token
+    without ever storing its bearer value.  It intentionally uses a distinct
+    token type and must travel in ``X-ECG-Visual-Grant`` rather than replacing
+    the user's normal Bearer authentication token.
+    """
+    token_id = uuid.uuid4().hex
+    now = utcnow()
+    token = jwt.encode({
+        "sub": str(user_id),
+        "jti": token_id,
+        "typ": "ecg_visual_grant",
+        "scope": "ecg:visual",
+        "ecg": str(ecg_id),
+        "grant": str(grant_id),
+        "iat": now,
+        "exp": expires_at,
+        "aud": "ecg-health-platform",
+    }, settings().jwt_secret, algorithm="HS256")
+    return token, token_id
+
+
+def visual_access_token_claims() -> dict | None:
+    """Return verified grant-token claims from the dedicated request header.
+
+    A missing header is not an authentication failure by itself: callers may
+    instead have the literal DOCTOR role.  A supplied but malformed/expired
+    header is rejected rather than silently falling back to a blurred view.
+    """
+    cached = getattr(g, "ecg_visual_access_claims", None)
+    if cached is not None:
+        return cached
+    token = request.headers.get("X-ECG-Visual-Grant", "").strip()
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings().jwt_secret, algorithms=["HS256"],
+                             audience="ecg-health-platform")
+    except jwt.PyJWTError as exc:
+        raise APIError("INVALID_ECG_VISUAL_GRANT", "The ECG visual-access token is invalid or expired.", 401) from exc
+    if (payload.get("typ") != "ecg_visual_grant" or payload.get("scope") != "ecg:visual"
+            or not all(isinstance(payload.get(key), str) for key in ("sub", "jti", "ecg", "grant"))):
+        raise APIError("INVALID_ECG_VISUAL_GRANT", "The ECG visual-access token is invalid or expired.", 401)
+    g.ecg_visual_access_claims = payload
+    return payload
+
+
 def _decoded_token(expected_type: str) -> dict:
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):

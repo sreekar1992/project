@@ -78,6 +78,12 @@ class ImageDigitizationRequest(APIModel):
     output_format: Literal["csv", "mat"] = "csv"
 
 
+class VisualAccessUnlockRequest(APIModel):
+    """One doctor-issued passcode for a single ECG visual session."""
+
+    passcode: str = Field(min_length=1, max_length=256)
+
+
 class DiagnosisInput(APIModel):
     display: str = Field(min_length=1, max_length=300)
     code_system: str | None = Field(default=None, max_length=200)

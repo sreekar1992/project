@@ -9,6 +9,10 @@ import type {
   EcgDigitizationResult,
   EcgRecord,
   EcgSecurityStatus,
+  EcgVisualAccessApproval,
+  EcgVisualAccessGrant,
+  EcgVisualAccessRequest,
+  EcgVisualAccessStatus,
   EcgWaveform,
   Encounter,
   MedicineCatalogResponse,
@@ -22,6 +26,7 @@ const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
 export const API_BASE_URL = (configuredBaseUrl || "/api/v1").replace(/\/$/, "");
 const ACCESS_TOKEN_KEY = "ecg-research-platform.access-token";
 const EXPLICIT_SIGN_OUT_KEY = "ecg-research-platform.signed-out";
+const ECG_VISUAL_GRANT_HEADER = "X-ECG-Visual-Grant";
 
 export class ApiError extends Error {
   constructor(
@@ -191,13 +196,36 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   return payload as T;
 }
 
-async function authorizedBlob(path: string, fallbackMessage: string): Promise<Blob> {
-  const response = await authorizedFetch(path, { headers: { Accept: "application/octet-stream" } });
+async function authorizedBlob(path: string, fallbackMessage: string, headers?: HeadersInit): Promise<Blob> {
+  const requestHeaders = new Headers(headers);
+  requestHeaders.set("Accept", "application/octet-stream");
+  const response = await authorizedFetch(path, { headers: requestHeaders });
   if (!response.ok) {
     const payload = await parsePayload(response);
     throw new ApiError(messageFromPayload(payload, fallbackMessage), response.status, payload);
   }
   return response.blob();
+}
+
+/**
+ * Checks a view-only credential before it is attached to an original-ECG
+ * request. The credential remains caller-owned React memory; this helper never
+ * writes it to browser storage.
+ */
+export function hasCurrentVisualAccessGrant(
+  grant: EcgVisualAccessGrant | undefined,
+  ecgId: string,
+  now = Date.now(),
+): boolean {
+  if (!grant?.access_token || !grant.expires_at) return false;
+  const grantedEcgId = grant.ecg_id ?? grant.ecg_uuid;
+  const expiresAt = Date.parse(grant.expires_at);
+  return grantedEcgId === ecgId && Number.isFinite(expiresAt) && expiresAt > now;
+}
+
+function visualGrantHeaders(grant: EcgVisualAccessGrant | undefined, ecgId: string): HeadersInit | undefined {
+  if (!grant || !hasCurrentVisualAccessGrant(grant, ecgId)) return undefined;
+  return { [ECG_VISUAL_GRANT_HEADER]: grant.access_token };
 }
 
 export const api = {
@@ -261,8 +289,38 @@ export const api = {
       return request<EcgRecord>("/ecgs", { method: "POST", body: form });
     },
     download: (ecgId: string) => authorizedBlob(`/ecgs/${encodeURIComponent(ecgId)}/file`, "The ECG file could not be downloaded."),
-    waveform: (ecgId: string) => request<EcgWaveform>(`/ecgs/${encodeURIComponent(ecgId)}/waveform`),
+    /** A non-signal, non-decryptable redacted preview for an otherwise scoped user. */
+    restrictedPreview: (ecgId: string) => authorizedBlob(`/ecgs/${encodeURIComponent(ecgId)}/protected-preview.png`, "The protected ECG preview could not be loaded."),
+    /** Inline ECG visual rendering only; never a source-file download. */
+    visualImage: (ecgId: string, grant?: EcgVisualAccessGrant) => authorizedBlob(
+      `/ecgs/${encodeURIComponent(ecgId)}/visual-image`,
+      "The authorized ECG image could not be rendered.",
+      visualGrantHeaders(grant, ecgId),
+    ),
+    waveform: (ecgId: string, grant?: EcgVisualAccessGrant) => request<EcgWaveform>(
+      `/ecgs/${encodeURIComponent(ecgId)}/waveform`,
+      { headers: visualGrantHeaders(grant, ecgId) },
+    ),
     security: (ecgId: string) => request<EcgSecurityStatus>(`/ecgs/${encodeURIComponent(ecgId)}/security`),
+    visualAccess: {
+      request: (ecgId: string) => request<EcgVisualAccessStatus>(
+        `/ecgs/${encodeURIComponent(ecgId)}/visual-access-requests`,
+        { method: "POST" },
+      ),
+      async status(ecgId: string): Promise<EcgVisualAccessStatus | null> {
+        const payload = await request<{ grant: EcgVisualAccessStatus | null }>(`/ecgs/${encodeURIComponent(ecgId)}/visual-access-grant`);
+        return payload.grant;
+      },
+      inbox: () => request<EcgVisualAccessRequest[] | PaginatedResponse<EcgVisualAccessRequest>>("/ecgs/visual-access-requests?status=PENDING"),
+      approve: (requestId: string) => request<EcgVisualAccessApproval>(
+        `/ecgs/visual-access-requests/${encodeURIComponent(requestId)}/approve`,
+        { method: "POST" },
+      ),
+      unlock: (ecgId: string, requestId: string, passcode: string) => request<EcgVisualAccessGrant>(
+        `/ecgs/${encodeURIComponent(ecgId)}/visual-access-requests/${encodeURIComponent(requestId)}/unlock`,
+        { method: "POST", body: { passcode } },
+      ),
+    },
     digitize: (ecgId: string, values: { output_format: "csv" | "mat"; confirm_experimental: true }) => request<EcgDigitizationResult>(
       `/ecgs/${encodeURIComponent(ecgId)}/digitize`,
       { method: "POST", body: values },
@@ -272,7 +330,11 @@ export const api = {
     list: (patientId: string) => request<Analysis[] | PaginatedResponse<Analysis>>(`/analyses?patient_id=${encodeURIComponent(patientId)}`),
     create: (values: { ecg_id: string }) => request<Analysis>("/analyses", { method: "POST", body: values }),
     assessmentSuggestion: (ecgId: string) => request<ResearchAssessmentSuggestion>(`/ecgs/${encodeURIComponent(ecgId)}/assessment-suggestion`),
-    explanation: (ecgId: string) => authorizedBlob(`/ecgs/${encodeURIComponent(ecgId)}/explain.png`, "The model explanation could not be loaded."),
+    explanation: (ecgId: string, grant?: EcgVisualAccessGrant) => authorizedBlob(
+      `/ecgs/${encodeURIComponent(ecgId)}/explain.png`,
+      "The model explanation could not be loaded.",
+      visualGrantHeaders(grant, ecgId),
+    ),
   },
   reviews: {
     list: (patientId: string) => request<ClinicalReview[] | PaginatedResponse<ClinicalReview>>(`/reviews?patient_id=${encodeURIComponent(patientId)}`),
