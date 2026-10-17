@@ -8,6 +8,13 @@ from ecg_cvd.gui import create_app
 
 
 class DeploymentConfigurationTests(unittest.TestCase):
+    def test_gke_frontend_proxy_keeps_api_calls_same_origin(self):
+        nginx_config = (Path(__file__).resolve().parents[1] / "frontend" / "nginx.gke.conf").read_text()
+
+        self.assertIn("proxy_pass http://ecg-platform-api:8080/api/;", nginx_config)
+        self.assertIn("proxy_set_header Host ecg-platform-api;", nginx_config)
+        self.assertIn('proxy_set_header Origin "";', nginx_config)
+
     def test_health_and_readiness_are_configurable(self):
         with TemporaryDirectory() as directory, patch.dict(os.environ, {
             "ECG_TRUSTED_HOSTS": "ecg-workbench",

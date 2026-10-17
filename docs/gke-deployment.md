@@ -64,3 +64,19 @@ kubectl -n ecg-clinical-research get service ecg-platform-frontend
 ```
 
 Check `/healthz`, `/readyz`, database connectivity, object storage, and a fake-data workflow from inside the approved private network. `/readyz` checks model presence only. Add TLS termination and an approved access gateway before using sensitive data. This research application is not a clinically validated service.
+
+### Cloud Shell browser preview
+
+For a short-lived operator preview, tunnel the internal frontend Service from
+Cloud Shell and use **Web Preview** on port `8081`:
+
+```sh
+kubectl -n ecg-clinical-research port-forward service/ecg-platform-frontend 8081:80
+```
+
+Keep that command running, then open the URL offered by Cloud Shell Web
+Preview, or print it with `echo "https://8081-$WEB_HOST"`. Do not add a
+session-specific `cloudshell.dev` hostname or a wildcard to `CORS_ORIGINS`.
+The GKE frontend proxies `/api/` to the private API as a same-origin request
+and intentionally removes the transient browser `Origin` header; direct API
+clients remain subject to the API's exact CORS allowlist.
