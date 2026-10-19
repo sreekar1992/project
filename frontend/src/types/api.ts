@@ -120,7 +120,7 @@ export interface EcgRecord {
   created_at?: string;
   waveform_url?: string;
   content_type?: string;
-  source_kind?: "WAVEFORM" | "ECG_IMAGE" | "JPEG_DIGITIZED_WAVEFORM" | string;
+  source_kind?: "WAVEFORM" | "ECG_IMAGE" | "JPEG_DIGITIZED_WAVEFORM" | "EXTERNAL_ECG_SOURCE" | string;
   source_ecg_id?: Identifier;
   provenance?: string | {
     kind?: string;
@@ -136,6 +136,9 @@ export interface EcgWaveform {
   duration_seconds: number;
   lead_count: number;
   amplitude_units?: string;
+  source_only?: boolean;
+  sample_count?: number;
+  time_axis_basis?: string;
   samples: number[];
 }
 

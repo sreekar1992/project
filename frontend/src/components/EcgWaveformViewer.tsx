@@ -82,8 +82,12 @@ export function EcgWaveformViewer({ samples, samplingRateHz, title = "ECG wavefo
     }
     if (!values.length) return null;
 
-    const rawMinimum = Math.min(...values);
-    const rawMaximum = Math.max(...values);
+    let rawMinimum = Infinity;
+    let rawMaximum = -Infinity;
+    for (const value of values) {
+      rawMinimum = Math.min(rawMinimum, value);
+      rawMaximum = Math.max(rawMaximum, value);
+    }
     const rawRange = rawMaximum - rawMinimum;
     const padding = Math.max(rawRange * 0.1, Math.abs(rawMaximum) * 0.02, 0.001);
     const minimum = rawMinimum - padding;

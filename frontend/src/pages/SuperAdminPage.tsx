@@ -44,7 +44,6 @@ import type {
   AdminHospital,
   AdminUser,
   AuditLogEntry,
-  AuthenticatedPrincipal,
   DashboardResponse,
   ModelVersionSummary,
   PlatformFeature,
@@ -81,7 +80,6 @@ const roleLabels: Record<ProvisionableRole, string> = {
 };
 
 const adminApi = {
-  identity: () => request<AuthenticatedPrincipal>("/auth/me"),
   dashboard: () => request<DashboardResponse>("/admin/dashboard"),
   hospitals: {
     list: () => request<AdminHospital[]>("/admin/hospitals"),
@@ -194,15 +192,7 @@ export function SuperAdminPage() {
   const [hospitalForm, setHospitalForm] = useState<HospitalFormValues>(initialHospitalForm);
   const [userForm, setUserForm] = useState<UserFormValues>(initialUserForm);
 
-  const identity = useQuery({
-    queryKey: ["auth", "me"],
-    queryFn: adminApi.identity,
-    retry: false,
-  });
-  const roles = useMemo(
-    () => new Set([...(user?.roles ?? []), ...(identity.data?.roles ?? [])]),
-    [identity.data?.roles, user?.roles],
-  );
+  const roles = useMemo(() => new Set(user?.roles ?? []), [user?.roles]);
   const isSuperAdmin = roles.has("SUPER_ADMIN");
 
   const dashboard = useQuery({ queryKey: ["admin", "dashboard"], queryFn: adminApi.dashboard, enabled: isSuperAdmin });
@@ -264,15 +254,6 @@ export function SuperAdminPage() {
     });
   }
 
-  if (identity.isLoading) return <LoadingState label="Checking the authenticated platform role…" />;
-  if (identity.isError) {
-    return (
-      <Stack spacing={2}>
-        <Box><Typography variant="h4">Super Administrator workspace</Typography><Typography color="text.secondary" sx={{ mt: 0.5 }}>The current role must be verified before platform administration data is requested.</Typography></Box>
-        <ApiErrorAlert error={identity.error} />
-      </Stack>
-    );
-  }
   if (!isSuperAdmin) {
     return (
       <Paper sx={{ p: 4, maxWidth: 760 }}>

@@ -44,7 +44,7 @@ import { ProtectedEcgPreview } from "../components/ProtectedEcgPreview";
 import { DoctorVisualAccessInbox, VisualAccessRequestPanel, visualAccessEcgId, visualAccessRequestId } from "../components/VisualAccessControls";
 import { useAuth } from "../lib/auth";
 import { api, hasCurrentVisualAccessGrant } from "../lib/api";
-import { listFromResponse, patientDisplayName, type EcgDigitizationResult, type EcgRecord, type EcgSecurityStatus, type EcgVisualAccessApproval, type EcgVisualAccessGrant, type EcgVisualAccessRequest, type MedicineSuggestion } from "../types/api";
+import { listFromResponse, patientDisplayName, type Analysis, type EcgDigitizationResult, type EcgRecord, type EcgSecurityStatus, type EcgVisualAccessApproval, type EcgVisualAccessGrant, type EcgVisualAccessRequest, type MedicineSuggestion } from "../types/api";
 
 const encounterSchema = z.object({
   encounter_type: z.string().trim().min(1, "Choose an encounter type."),
@@ -112,6 +112,10 @@ function confidenceValue(confidence?: number): number | undefined {
 
 function isEcgImage(record: Pick<EcgRecord, "filename" | "source_filename" | "content_type" | "source_kind">): boolean {
   return record.source_kind === "ECG_IMAGE" || record.content_type === "image/jpeg" || /\.(jpe?g)$/i.test(record.filename ?? record.source_filename ?? "");
+}
+
+function isSourceOnlyEcg(record: Pick<EcgRecord, "source_kind" | "status">): boolean {
+  return record.source_kind === "EXTERNAL_ECG_SOURCE" || record.status === "SOURCE_ONLY";
 }
 
 function isDigitizedEcg(record: Pick<EcgRecord, "source_kind" | "provenance">): boolean {
@@ -376,6 +380,7 @@ export function PatientDetailPage() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadEncounter, setUploadEncounter] = useState("");
   const [recentUpload, setRecentUpload] = useState<EcgRecord | null>(null);
+  const [autoAnalysisEcgId, setAutoAnalysisEcgId] = useState("");
   const [analysisEcg, setAnalysisEcg] = useState("");
   const [viewerEcgId, setViewerEcgId] = useState("");
   const [imageViewerEcgId, setImageViewerEcgId] = useState("");
@@ -405,7 +410,13 @@ export function PatientDetailPage() {
   const patient = useQuery({ queryKey: ["patient", patientId], queryFn: () => api.patients.get(patientId), enabled: Boolean(patientId) });
   const encounters = useQuery({ queryKey: ["encounters", patientId], queryFn: () => api.encounters.list(patientId), enabled: Boolean(patientId) });
   const ecgs = useQuery({ queryKey: ["ecgs", patientId], queryFn: () => api.ecgs.list(patientId), enabled: Boolean(patientId) });
-  const analyses = useQuery({ queryKey: ["analyses", patientId], queryFn: () => api.analyses.list(patientId), enabled: Boolean(patientId) });
+  const analyses = useQuery({
+    queryKey: ["analyses", patientId],
+    queryFn: () => api.analyses.list(patientId),
+    enabled: Boolean(patientId),
+    refetchInterval: (query) => listFromResponse<Analysis>(query.state.data ?? [])
+      .some((analysis) => analysis.status === "QUEUED" || analysis.status === "PROCESSING") ? 3000 : false,
+  });
   const reviews = useQuery({ queryKey: ["reviews", patientId], queryFn: () => api.reviews.list(patientId), enabled: Boolean(patientId) });
   const reports = useQuery({ queryKey: ["reports", patientId], queryFn: () => api.reports.list(patientId), enabled: Boolean(patientId) });
   const hasVisualGrantFor = (ecgId: string): boolean => hasCurrentVisualAccessGrant(visualAccessGrants[ecgId], ecgId, grantClock);
@@ -452,6 +463,8 @@ export function PatientDetailPage() {
     // rather than carrying any temporary credential across route changes.
     setVisualAccessGrants({});
     setVisualAccessApproval(undefined);
+    setAutoAnalysisEcgId("");
+    setRecentUpload(null);
   }, [patientId]);
 
   useEffect(() => {
@@ -492,9 +505,11 @@ export function PatientDetailPage() {
     onSuccess: (record) => {
       queryClient.invalidateQueries({ queryKey: ["ecgs", patientId] });
       setRecentUpload(record);
+      const autoAnalyze = canUseResearchModel && record.source_kind === "WAVEFORM" && /\.mat$/i.test(ecgFilename(record));
+      setAutoAnalysisEcgId(autoAnalyze ? record.id : "");
       if (!canViewOriginalEcg) {
         setProtectedPreviewEcgId(record.id);
-        setAnalysisEcg("");
+        setAnalysisEcg(autoAnalyze ? record.id : "");
         setViewerEcgId("");
         setImageViewerEcgId("");
       } else if (isEcgImage(record)) {
@@ -504,16 +519,17 @@ export function PatientDetailPage() {
         setImageViewerEcgId(record.id);
       } else {
         setProtectedPreviewEcgId("");
-        setAnalysisEcg(record.id);
+        setAnalysisEcg(isSourceOnlyEcg(record) ? "" : record.id);
         setViewerEcgId(record.id);
         setImageViewerEcgId("");
       }
       setSelectedFile(null);
       setUploadEncounter("");
+      if (autoAnalyze) requestAnalysis.mutate(record.id);
     },
   });
   const requestAnalysis = useMutation({
-    mutationFn: () => api.analyses.create({ ecg_id: analysisEcg }),
+    mutationFn: (ecgId: string) => api.analyses.create({ ecg_id: ecgId }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["analyses", patientId] }),
   });
   const requestVisualAccess = useMutation({
@@ -624,6 +640,7 @@ export function PatientDetailPage() {
   const encounterItems = listFromResponse(encounters.data ?? []);
   const ecgItems = listFromResponse(ecgs.data ?? []);
   const analysisItems = listFromResponse(analyses.data ?? []);
+  const recentUploadAnalysis = analysisItems.find((analysis) => analysis.ecg_id === autoAnalysisEcgId);
   const selectedReviewAnalysis = analysisItems.find((analysis) => analysis.id === reviewForm.watch("analysis_id"));
   const reviewItems = listFromResponse(reviews.data ?? []);
   const reportItems = listFromResponse(reports.data ?? []);
@@ -648,8 +665,9 @@ export function PatientDetailPage() {
     ?? (recentDigitization?.derived_ecg.id === protectedPreviewEcgId ? recentDigitization.derived_ecg : undefined)
     ?? (recentUpload?.id === protectedPreviewEcgId ? recentUpload : undefined);
   const digitizationSourceEcg = ecgItems.find((ecg) => ecg.id === digitizationEcgId);
-  const waveformEcgItems = ecgItems.filter((ecg) => !isEcgImage(ecg));
+  const waveformEcgItems = ecgItems.filter((ecg) => !isEcgImage(ecg) && !isSourceOnlyEcg(ecg));
   const selectedFileIsImage = /\.(jpe?g)$/i.test(selectedFile?.name ?? "");
+  const selectedFileIsMat = /\.mat$/i.test(selectedFile?.name ?? "");
   const recentDigitizationConfidence = confidenceValue(recentDigitization?.analysis.confidence);
 
   return (
@@ -698,16 +716,22 @@ export function PatientDetailPage() {
               </FormControl>
               <Button component="label" variant="outlined" startIcon={<CloudUploadOutlinedIcon />}>
                 {selectedFile ? selectedFile.name : "Choose ECG file"}
-                <input hidden type="file" accept=".mat,.csv,.jpg,.jpeg,image/jpeg" onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)} />
+                <input hidden type="file" accept=".mat,.csv,.jpg,.jpeg,image/jpeg" onChange={(event) => { setSelectedFile(event.target.files?.[0] ?? null); setRecentUpload(null); setAutoAnalysisEcgId(""); uploadEcg.reset(); }} />
               </Button>
               {selectedFile && (
-                <Alert severity={selectedFileIsImage ? "info" : "success"} sx={{ py: 0.25 }}>
+                <Alert severity={selectedFileIsImage || selectedFileIsMat ? "info" : "success"} sx={{ py: 0.25 }}>
                   {selectedFileIsImage
                     ? "JPEG ECG image selected. It will be retained for authorized visual review; raw-waveform prediction requires a .mat or .csv recording."
-                    : "Waveform file selected. Its stored encryption status and integrity check will be verified after upload."}
+                    : selectedFileIsMat
+                      ? "For authorized clinical roles, a MAT waveform passing the 3,600-sample input check automatically requests research analysis. Verify the lead and 360 Hz acquisition separately. External 'sinalf1'/'TEMPO1' files remain view-only; no upload provides clinical clearance."
+                    : "Waveform file selected. The server requires one 3,600-sample ECG signal (10 seconds at 360 Hz) before it can store and analyze the recording."}
                 </Alert>
               )}
               <Button variant="contained" onClick={() => uploadEcg.mutate()} disabled={!selectedFile || !uploadEncounter || uploadEcg.isPending}>{uploadEcg.isPending ? "Uploading…" : "Upload recording"}</Button>
+              {recentUpload?.id === autoAnalysisEcgId && requestAnalysis.isPending && <Alert severity="info">Compatible MAT uploaded. Research analysis is being requested; a clinician must review the result.</Alert>}
+              {recentUpload?.id === autoAnalysisEcgId && requestAnalysis.isError && <ApiErrorAlert error={requestAnalysis.error} />}
+              {recentUpload?.id === autoAnalysisEcgId && requestAnalysis.data && <Alert severity="info">Research analysis {(recentUploadAnalysis?.status ?? requestAnalysis.data.status ?? "requested").toLowerCase()}. Check the AI research analyses section below; this is not clinical clearance.</Alert>}
+              {recentUpload && isSourceOnlyEcg(recentUpload) && <Alert severity="info">Stored as an external ECG source for authorized viewing only. No AI analysis or clinical clearance was performed.</Alert>}
               {recentUpload && <RecentUploadProtection ecgId={recentUpload.id} filename={ecgFilename(recentUpload)} />}
             </Stack>
           </Paper>
@@ -728,10 +752,12 @@ export function PatientDetailPage() {
                     <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
                       <Typography fontWeight={700}>{ecgFilename(ecg)}</Typography>
                       {isImage && <Chip size="small" label="JPEG source image" color="info" variant="outlined" />}
+                      {isSourceOnlyEcg(ecg) && <Chip size="small" label="Source only · no AI analysis" color="info" variant="outlined" />}
                       {isDigitizedEcg(ecg) && <Chip size="small" label="Experimental JPEG-derived waveform" color="warning" variant="outlined" />}
                     </Stack>
                     <Typography variant="body2" color="text.secondary">Uploaded/acquired: {formatDate(ecg.acquired_at ?? ecg.created_at)} · Status: {ecg.status ?? "unknown"}</Typography>
                     {isImage && <Typography variant="caption" color="text.secondary">This source image is never sent directly to RAMNV2. An authorized user may explicitly create a separate experimental numerical derivative.</Typography>}
+                    {isSourceOnlyEcg(ecg) && <Typography variant="caption" color="text.secondary">Original MAT retained for authorized viewing and download. The source duration supports the display time axis; the acquisition sampling rate and lead are unverified.</Typography>}
                     {isDigitizedEcg(ecg) && <Typography variant="caption" color="warning.dark">Derived from a JPEG trace extraction. Treat waveform and score as research artifacts requiring clinician review.</Typography>}
                     {!canViewOriginalEcg && !canRenderThisEcg && <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.4 }}>Original ECG pixels and waveform values are locked for this role. Only a non-clinical protected camouflage preview is available until a doctor approves a temporary visual grant.</Typography>}
                     {!canViewOriginalEcg && canRenderThisEcg && <Typography variant="caption" color="success.dark" sx={{ display: "block", mt: 0.4 }}>Temporary doctor-approved visual access is active until {formatDate(temporaryGrant?.expires_at)}. It is view-only and cannot be downloaded.</Typography>}
@@ -896,6 +922,8 @@ export function PatientDetailPage() {
                   <Typography variant="body2" color="text.secondary">
                     {viewedEcgIsDigitized
                       ? `This numerical waveform was estimated from ${activeViewedEcg ? ecgFilename(activeViewedEcg) : "a JPEG ECG source image"}. It is not the original device acquisition and is shown for research review only.`
+                      : isSourceOnlyEcg(activeViewedEcg ?? {})
+                        ? `Source waveform from ${activeViewedEcg ? ecgFilename(activeViewedEcg) : "the selected recording"}. Time is scaled from the source TEMPO1 duration; the device sampling rate, lead, and amplitude calibration are unverified. No AI analysis is available.`
                       : `Single-lead source waveform from ${activeViewedEcg ? ecgFilename(activeViewedEcg) : "the selected recording"}. Zoom and pan happen only in this browser session.`}
                   </Typography>
                 </Box>
@@ -903,7 +931,7 @@ export function PatientDetailPage() {
               </Stack>
               {waveform.isLoading && <LoadingState label="Loading authorized waveform…" />}
               {waveform.isError && <ApiErrorAlert error={waveform.error} />}
-              {waveform.data && <EcgWaveformViewer samples={waveform.data.samples} samplingRateHz={waveform.data.sampling_rate_hz} title={viewedEcgIsDigitized ? "Experimental JPEG-derived ECG waveform" : "Authorized single-lead ECG waveform"} />}
+              {waveform.data && <EcgWaveformViewer samples={waveform.data.samples} samplingRateHz={waveform.data.sampling_rate_hz} title={waveform.data.source_only ? "Authorized source ECG waveform" : viewedEcgIsDigitized ? "Experimental JPEG-derived ECG waveform" : "Authorized single-lead ECG waveform"} />}
             </Stack>
           </Paper>
         ) : (
@@ -1014,7 +1042,7 @@ export function PatientDetailPage() {
                 </Select>
               </FormControl>
               {!waveformEcgItems.length && <Typography variant="caption" color="text.secondary">Upload a native .mat or .csv waveform, or explicitly create an experimental numerical derivative from a JPEG source image before requesting analysis.</Typography>}
-              <Button variant="contained" startIcon={<PlayCircleOutlineOutlinedIcon />} onClick={() => requestAnalysis.mutate()} disabled={!analysisEcg || requestAnalysis.isPending}>{requestAnalysis.isPending ? "Requesting…" : "Request analysis"}</Button>
+              <Button variant="contained" startIcon={<PlayCircleOutlineOutlinedIcon />} onClick={() => requestAnalysis.mutate(analysisEcg)} disabled={!analysisEcg || requestAnalysis.isPending}>{requestAnalysis.isPending ? "Requesting…" : "Request analysis"}</Button>
             </Stack>
           </Paper>
         </Box>

@@ -85,15 +85,21 @@ def read_signal(data: bytes, filename: str) -> np.ndarray:
                 raw = arrays["val"]
             else:
                 candidates = [v for v in arrays.values() if v.ndim == 1 and v.size == 3600]
-                if len(candidates) != 1:
-                    raise ValueError("Use a MAT file with one 3,600-sample 'val' waveform.")
-                raw = candidates[0]
+                if len(candidates) == 1:
+                    raw = candidates[0]
+                else:
+                    waveforms = [v for v in arrays.values() if v.ndim == 1]
+                    if candidates or len(waveforms) != 1:
+                        raise ValueError("Use a MAT file with one 3,600-sample 'val' waveform.")
+                    raw = waveforms[0]
         elif suffix == ".csv":
             raw = np.loadtxt(BytesIO(data), delimiter=",").squeeze()
         else:
             raise ValueError("Upload a .mat or .csv ECG signal. Images can be encrypted in the security panel.")
-        if raw.ndim != 1 or raw.size != 3600 or np.iscomplexobj(raw):
+        if raw.ndim != 1 or np.iscomplexobj(raw):
             raise ValueError("Expected one real-valued waveform with 3,600 samples (10 seconds at 360 Hz).")
+        if raw.size != 3600:
+            raise ValueError(f"Expected 3,600 samples (10 seconds at 360 Hz); received {raw.size:,} samples. Check the lead and sampling rate before conversion.")
         raw = raw.astype(np.float32)
         if not np.isfinite(raw).all() or float(np.ptp(raw)) == 0:
             raise ValueError("ECG data must contain finite values and a non-flat waveform.")

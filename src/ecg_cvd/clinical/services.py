@@ -15,6 +15,8 @@ from cryptography.exceptions import InvalidTag
 from flask import current_app
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from scipy.io import savemat
 from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +28,7 @@ from .db import get_session
 from .image_digitization import (OUTPUT_SAMPLING_RATE_HZ, DigitizedTrace,
                                  digitize_ecg_jpeg)
 from .image_validation import validate_jpeg_image
+from .source_ecg import read_source_ecg
 from ..crypto import decrypt_password, encrypt_password
 from .models import (AIAnalysis, AIModel, AIModelVersion, AIPrediction, AuditEvent, ClinicalNote,
                      Condition, DiagnosticReport, DoctorReview, ECGFile, ECGRecord, ECGVisualAccessGrant,
@@ -718,15 +721,17 @@ class ClinicalService:
     @staticmethod
     def ecg_dict(ecg: ECGRecord) -> dict[str, Any]:
         image_only = ecg.status == "IMAGE_ONLY"
+        source_only = ecg.status == "SOURCE_ONLY"
         source_ecg_id = ClinicalService._digitized_source_ecg_id(ecg)
         source_kind = ("ECG_IMAGE" if image_only else
+                       "EXTERNAL_ECG_SOURCE" if source_only else
                        "JPEG_DIGITIZED_WAVEFORM" if source_ecg_id else "WAVEFORM")
         result: dict[str, Any] = {
             "ecg_uuid": str(ecg.ecg_uuid), "patient_uuid": str(ecg.patient_uuid),
             "encounter_uuid": str(ecg.encounter_uuid), "accession_number": ecg.accession_number,
             "recorded_at": ecg.recorded_at.isoformat(), "device_id": ecg.device_id,
-            "sampling_rate": None if image_only else ecg.sampling_rate,
-            "lead_count": None if image_only else ecg.lead_count,
+            "sampling_rate": None if image_only or source_only else ecg.sampling_rate,
+            "lead_count": None if image_only or source_only else ecg.lead_count,
             "duration_seconds": None if image_only else ecg.duration_seconds,
             "source_kind": source_kind, "status": ecg.status,
         }
@@ -914,7 +919,8 @@ class ClinicalService:
                             "size_bytes": file.size_bytes})
         return records
 
-    def upload_ecg(self, encounter_uuid: str, payload: bytes, filename: str, device_id: str | None = None) -> dict[str, Any]:
+    def upload_ecg(self, encounter_uuid: str, payload: bytes, filename: str, device_id: str | None = None,
+                   source_only: bool = False) -> dict[str, Any]:
         suffix = Path(filename).suffix.lower()
         if suffix not in WAVEFORM_SUFFIXES | JPEG_SUFFIXES:
             raise APIError("UNSUPPORTED_ECG_FORMAT", "Only .mat, .csv, .jpg, and .jpeg ECG files are accepted.", 400)
@@ -923,17 +929,38 @@ class ClinicalService:
         if len(payload) > current_app.config["MAX_CONTENT_LENGTH"]:
             raise APIError("FILE_TOO_LARGE", "The ECG upload exceeds the configured file limit.", 413)
         image_only = suffix in JPEG_SUFFIXES
+        if source_only and suffix != ".mat":
+            raise APIError("SOURCE_FORMAT_REQUIRED", "Source-only storage requires a .mat file.", 400)
+        source = None
+        if suffix == ".mat":
+            try:
+                source = read_source_ecg(payload)
+            except ValueError as exc:
+                if source_only:
+                    raise APIError("INVALID_SOURCE_ECG", str(exc), 422) from exc
+            else:
+                source_only = True
         if image_only:
             validate_jpeg_image(payload)
-        else:
+        elif not source_only:
             if self.adapter is None:
                 raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model is configured for file validation.", 503)
-            self.adapter.validate(payload, filename)
+            try:
+                self.adapter.validate(payload, filename)
+            except ValueError as exc:
+                detail = str(exc)
+                if suffix == ".mat":
+                    detail += " Other ECG-machine MAT layouts need a validated importer; they cannot be sent to this model automatically."
+                raise APIError("INVALID_ECG_WAVEFORM", detail, 422) from exc
         encounter = self._encounter(encounter_uuid)
         org = self._organization_id()
         ecg = ECGRecord(patient_uuid=encounter.patient_uuid, encounter_uuid=encounter.encounter_uuid,
                         organization_id=org, accession_number=f"ECG-{uuid.uuid4().hex[:12].upper()}",
-                        device_id=device_id, status="IMAGE_ONLY" if image_only else "VALIDATING")
+                        device_id=device_id if not source_only else None,
+                        sampling_rate=0.0 if source_only else 360.0,
+                        lead_count=0 if source_only else 1,
+                        duration_seconds=source.duration_seconds if source_only else 10.0,
+                        status="SOURCE_ONLY" if source_only else "IMAGE_ONLY" if image_only else "VALIDATING")
         self.session.add(ecg)
         self.session.flush()
         object_key = f"organizations/{org}/ecgs/{ecg.ecg_uuid}/original/{uuid.uuid4().hex}{suffix}"
@@ -943,12 +970,13 @@ class ClinicalService:
         self.session.add(ECGFile(ecg_uuid=ecg.ecg_uuid, storage_uri=stored.uri, object_key=stored.object_key,
                                  sha256=stored.sha256, content_type=stored.content_type,
                                  original_filename=Path(filename).name, size_bytes=stored.size_bytes))
-        if not image_only:
+        if not image_only and not source_only:
             ecg.status = "READY"
         self.session.commit()
         audit("ECG_UPLOADED", "ecg", str(ecg.ecg_uuid), organization_id=org,
               metadata={"format": suffix.removeprefix("."), "size_bytes": stored.size_bytes,
-                        "source_kind": "ECG_IMAGE" if image_only else "WAVEFORM"})
+                        "source_kind": "ECG_IMAGE" if image_only else
+                                       "EXTERNAL_ECG_SOURCE" if source_only else "WAVEFORM"})
         self.session.commit()
         return {**self.ecg_dict(ecg), "filename": Path(filename).name, "content_type": stored.content_type,
                 "size_bytes": stored.size_bytes}
@@ -1178,8 +1206,11 @@ class ClinicalService:
             content_type = JPEG_CONTENT_TYPE
         else:
             waveform, _file = self._raw_ecg_waveform(ecg)
-            assert self.adapter is not None
-            data = self.adapter.render_waveform(waveform)
+            if ecg.status == "SOURCE_ONLY":
+                data = self._source_waveform_png(waveform, ecg.duration_seconds)
+            else:
+                assert self.adapter is not None
+                data = self.adapter.render_waveform(waveform)
             content_type = "image/png"
         audit("ECG_INLINE_VISUAL_VIEWED", "ecg", str(ecg.ecg_uuid), organization_id=ecg.organization_id,
               metadata={"source_kind": "image" if self._is_image_only_file(file) else "rendered_waveform"})
@@ -1249,11 +1280,16 @@ class ClinicalService:
         file = self._file_for_ecg(ecg)
         if self._is_image_only_file(file):
             raise self._image_only_error()
-        if self.adapter is None:
+        if ecg.status != "SOURCE_ONLY" and self.adapter is None:
             raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model is configured for waveform validation.", 503)
         data = self.storage.get_bytes(file.object_key)
         if hashlib.sha256(data).hexdigest() != file.sha256:
             raise APIError("ASSET_INTEGRITY_ERROR", "The stored ECG asset failed an integrity check.", 500)
+        if ecg.status == "SOURCE_ONLY":
+            try:
+                return read_source_ecg(data).waveform, file
+            except ValueError as exc:
+                raise APIError("INVALID_SOURCE_ECG", "The stored source ECG is no longer readable.", 500) from exc
         return self.adapter.validate(data, file.original_filename), file
 
     def waveform_data(self, ecg_uuid: str) -> dict[str, Any]:
@@ -1262,11 +1298,33 @@ class ClinicalService:
         self._require_ecg_visual_access(ecg)
         waveform, _file = self._raw_ecg_waveform(ecg)
         audit("ECG_WAVEFORM_VIEWED", "ecg", str(ecg.ecg_uuid), organization_id=ecg.organization_id,
-              metadata={"sampling_rate_hz": ecg.sampling_rate, "sample_count": int(waveform.size)})
+              metadata={"source_only": ecg.status == "SOURCE_ONLY", "sample_count": int(waveform.size)})
         self.session.commit()
-        return {"ecg_uuid": str(ecg.ecg_uuid), "sampling_rate_hz": ecg.sampling_rate,
+        source_only = ecg.status == "SOURCE_ONLY"
+        return {"ecg_uuid": str(ecg.ecg_uuid),
+                "sampling_rate_hz": waveform.size / ecg.duration_seconds if source_only else ecg.sampling_rate,
                 "duration_seconds": ecg.duration_seconds, "lead_count": ecg.lead_count,
-                "amplitude_units": "dataset units", "samples": waveform.astype(float).tolist()}
+                "amplitude_units": "source dataset units" if source_only else "dataset units",
+                "source_only": source_only, "sample_count": int(waveform.size),
+                "time_axis_basis": "source TEMPO1 duration" if source_only else "360 Hz model input",
+                "samples": waveform.astype(float).tolist()}
+
+    @staticmethod
+    def _source_waveform_png(waveform: np.ndarray, duration_seconds: float) -> bytes:
+        figure = Figure(figsize=(10, 3), dpi=140, facecolor="#ffffff")
+        FigureCanvasAgg(figure)
+        axis = figure.add_subplot(111)
+        stride = max(1, int(np.ceil(waveform.size / 10_000)))
+        indexes = np.arange(0, waveform.size, stride)
+        axis.plot(indexes * duration_seconds / waveform.size, waveform[indexes],
+                  color="#075d76", linewidth=0.7)
+        axis.set(xlim=(0, duration_seconds), xlabel="Time from source duration (seconds)",
+                 ylabel="Source amplitude (dataset units)", title="Authorized source ECG waveform")
+        axis.grid(alpha=0.18, color="#94a3b8")
+        figure.subplots_adjust(left=0.1, right=0.98, bottom=0.22, top=0.88)
+        output = BytesIO()
+        figure.savefig(output, format="png")
+        return output.getvalue()
 
     def waveform_png(self, ecg: ECGRecord) -> bytes:
         """Create a non-persistent waveform rendering for an authorized report."""
@@ -1280,6 +1338,8 @@ class ClinicalService:
         file = self._file_for_ecg(ecg)
         if self._is_image_only_file(file):
             raise self._image_only_error()
+        if ecg.status == "SOURCE_ONLY":
+            raise APIError("ECG_SOURCE_ONLY", "This source ECG is stored for viewing only; AI analysis is disabled because it does not match the validated model input.", 409)
         if self.adapter is None:
             raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model artifact is configured.", 503)
         if ecg.status not in {"READY", "ANALYZED", "REVIEW_REQUIRED", "REVIEWED"}:
@@ -1302,6 +1362,8 @@ class ClinicalService:
         if analysis is None:
             raise APIError("ANALYSIS_NOT_FOUND", "The analysis could not be found.", 404)
         ecg = self._ecg(analysis.ecg_uuid)
+        if ecg.status == "SOURCE_ONLY":
+            raise APIError("ECG_SOURCE_ONLY", "AI analysis is disabled for source-only ECG records.", 409)
         if self.adapter is None:
             raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model artifact is configured.", 503)
         file = self._file_for_ecg(ecg)

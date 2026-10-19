@@ -34,6 +34,16 @@ def waveform_mat() -> bytes:
     return stream.getvalue()
 
 
+def external_source_mat(sample_count: int = 73_997) -> bytes:
+    stream = BytesIO()
+    savemat(stream, {
+        "sinalf1": np.sin(np.arange(sample_count, dtype=np.float64) / 17).reshape(1, -1),
+        "TEMPO1": np.array([[300]], dtype=np.uint64),
+        "ECGch_2": np.arange(sample_count, dtype=np.int32).reshape(-1, 1),
+    }, do_compression=True)
+    return stream.getvalue()
+
+
 def ecg_jpeg() -> bytes:
     """A small stand-in for an authorized ECG-paper/photo source image."""
     stream = BytesIO()
@@ -244,6 +254,111 @@ class ClinicalPlatformTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 400, response.get_json())
         self.assertEqual(response.get_json()["error"]["code"], "INVALID_ECG_IMAGE")
+        listed = client.get(f"/api/v1/ecgs?patient_id={patient_id}", headers=headers)
+        self.assertEqual(listed.status_code, 200, listed.get_json())
+        self.assertEqual(listed.get_json(), [])
+
+    def test_incompatible_mat_waveform_returns_actionable_validation_error(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        stream = BytesIO()
+        savemat(stream, {"ECGch_2": np.sin(np.arange(53977, dtype=np.float32) / 17)})
+        response = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "file": (BytesIO(stream.getvalue()), "Patient_0017_Down.mat"),
+        })
+        self.assertEqual(response.status_code, 422, response.get_json())
+        self.assertEqual(response.get_json()["error"]["code"], "INVALID_ECG_WAVEFORM")
+        self.assertIn("53,977 samples", response.get_json()["error"]["message"])
+        listed = client.get(f"/api/v1/ecgs?patient_id={patient_id}", headers=headers)
+        self.assertEqual(listed.status_code, 200, listed.get_json())
+        self.assertEqual(listed.get_json(), [])
+
+    def test_external_mat_source_only_upload_view_download_and_analysis_block(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        source = external_source_mat()
+        upload = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "source_only": "true", "file": (BytesIO(source), "external.mat"),
+        })
+        self.assertEqual(upload.status_code, 201, upload.get_json())
+        created = upload.get_json()
+        self.assertEqual(created["status"], "SOURCE_ONLY")
+        self.assertEqual(created["source_kind"], "EXTERNAL_ECG_SOURCE")
+        self.assertIsNone(created["sampling_rate"])
+        self.assertIsNone(created["lead_count"])
+        self.assertEqual(created["duration_seconds"], 300)
+        ecg_id = created["id"]
+
+        listed = client.get(f"/api/v1/ecgs?patient_id={patient_id}", headers=headers)
+        self.assertEqual(listed.status_code, 200, listed.get_json())
+        self.assertEqual(listed.get_json()[0]["source_kind"], "EXTERNAL_ECG_SOURCE")
+
+        security = client.get(f"/api/v1/ecgs/{ecg_id}/security", headers=headers)
+        self.assertEqual(security.status_code, 200, security.get_json())
+        self.assertTrue(security.get_json()["storage"]["encrypted_at_rest"])
+        with self.app.app_context():
+            stored_file = get_session().scalar(select(ECGFile).where(ECGFile.ecg_uuid == uuid.UUID(ecg_id)))
+            self.assertIsNotNone(stored_file)
+            encrypted = (self.root / "private_objects" / stored_file.object_key).read_bytes()
+            self.assertTrue(encrypted.startswith(b"ECG-CLINICAL-AESGCM-1\x00"))
+        downloaded = client.get(f"/api/v1/ecgs/{ecg_id}/file", headers=headers)
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(downloaded.data, source)
+
+        waveform = client.get(f"/api/v1/ecgs/{ecg_id}/waveform", headers=headers)
+        self.assertEqual(waveform.status_code, 200, waveform.get_json())
+        viewed = waveform.get_json()
+        self.assertTrue(viewed["source_only"])
+        self.assertEqual(viewed["sample_count"], 73_997)
+        self.assertEqual(len(viewed["samples"]), 73_997)
+        self.assertAlmostEqual(viewed["sampling_rate_hz"], 73_997 / 300)
+        self.assertEqual(viewed["time_axis_basis"], "source TEMPO1 duration")
+
+        inline = client.get(f"/api/v1/ecgs/{ecg_id}/visual-image", headers=headers)
+        self.assertEqual(inline.status_code, 200)
+        self.assertEqual(inline.mimetype, "image/png")
+        self.assertTrue(inline.data.startswith(b"\x89PNG\r\n\x1a\n"))
+
+        technician, technician_headers = self.client_for("technician@example.test")
+        denied_waveform = technician.get(f"/api/v1/ecgs/{ecg_id}/waveform", headers=technician_headers)
+        self.assertEqual(denied_waveform.status_code, 403, denied_waveform.get_json())
+        denied_download = technician.get(f"/api/v1/ecgs/{ecg_id}/file", headers=technician_headers)
+        self.assertEqual(denied_download.status_code, 403, denied_download.get_json())
+        protected = technician.get(f"/api/v1/ecgs/{ecg_id}/protected-preview.png", headers=technician_headers)
+        self.assertEqual(protected.status_code, 200)
+
+        analysis = client.post(f"/api/v1/ecgs/{ecg_id}/analyze", headers=headers)
+        self.assertEqual(analysis.status_code, 409, analysis.get_json())
+        self.assertEqual(analysis.get_json()["error"]["code"], "ECG_SOURCE_ONLY")
+        with self.app.app_context():
+            self.assertEqual(get_session().scalars(select(AIAnalysis).where(
+                AIAnalysis.ecg_uuid == uuid.UUID(ecg_id))).all(), [])
+
+    def test_external_mat_is_detected_without_source_only_checkbox(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        upload = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "file": (BytesIO(external_source_mat(55_875)), "external-machine.mat"),
+        })
+        self.assertEqual(upload.status_code, 201, upload.get_json())
+        created = upload.get_json()
+        self.assertEqual(created["status"], "SOURCE_ONLY")
+        self.assertEqual(created["source_kind"], "EXTERNAL_ECG_SOURCE")
+        waveform = client.get(f"/api/v1/ecgs/{created['id']}/waveform", headers=headers)
+        self.assertEqual(waveform.status_code, 200, waveform.get_json())
+        self.assertEqual(waveform.get_json()["sample_count"], 55_875)
+        analysis = client.post(f"/api/v1/ecgs/{created['id']}/analyze", headers=headers)
+        self.assertEqual(analysis.status_code, 409, analysis.get_json())
+        self.assertEqual(analysis.get_json()["error"]["code"], "ECG_SOURCE_ONLY")
+
+    def test_external_source_flag_rejects_incomplete_mat(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        response = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "source_only": "true", "file": (BytesIO(waveform_mat()), "ordinary.mat"),
+        })
+        self.assertEqual(response.status_code, 422, response.get_json())
+        self.assertEqual(response.get_json()["error"]["code"], "INVALID_SOURCE_ECG")
         listed = client.get(f"/api/v1/ecgs?patient_id={patient_id}", headers=headers)
         self.assertEqual(listed.status_code, 200, listed.get_json())
         self.assertEqual(listed.get_json(), [])

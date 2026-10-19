@@ -398,7 +398,8 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
             raise APIError("ENCOUNTER_PATIENT_MISMATCH", "The selected encounter is not for the requested patient.", 409)
         record = service.upload_ecg(str(encounter.encounter_uuid), uploaded.read(),
                                     secure_filename(uploaded.filename) or "uploaded.mat",
-                                    request.form.get("device_id"))
+                                    request.form.get("device_id"),
+                                    source_only=request.form.get("source_only") == "true")
         return jsonify(_ecg_response(record)), 201
 
     @api.get("/ecgs/<ecg_id>")

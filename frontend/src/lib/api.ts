@@ -281,10 +281,11 @@ export const api = {
   },
   ecgs: {
     list: (patientId: string) => request<EcgRecord[] | PaginatedResponse<EcgRecord>>(`/ecgs?patient_id=${encodeURIComponent(patientId)}`),
-    upload: (values: { patientId: string; encounterId?: string; file: File }) => {
+    upload: (values: { patientId: string; encounterId?: string; file: File; sourceOnly?: boolean }) => {
       const form = new FormData();
       form.append("patient_id", values.patientId);
       if (values.encounterId) form.append("encounter_id", values.encounterId);
+      if (values.sourceOnly) form.append("source_only", "true");
       form.append("file", values.file);
       return request<EcgRecord>("/ecgs", { method: "POST", body: form });
     },
