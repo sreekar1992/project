@@ -19,7 +19,7 @@ from .models import (AIAnalysis, AIModel, AIModelVersion, Condition, DiagnosticR
                      Encounter, Feature, Organization, PatientContact, PatientIdentifier, Practitioner,
                      Prescription, PrescriptionItem, ReportDocument, User)
 from .schemas import (EncounterRequest, FeatureRequest, ImageDigitizationRequest, LoginRequest,
-                      OrganizationRequest, PatientMatchRequest, PatientRequest, ReviewRequest, UserRequest,
+                      OrganizationRequest, PatientMatchRequest, PatientRequest, ReviewRequest, SourceDerivationRequest, UserRequest,
                       VisualAccessUnlockRequest)
 from .security import (APIError, audit, current_principal, issue_token_pair, password_matches,
                        require_any_permission, require_permission, require_role, revoke_refresh_token, settings,
@@ -500,6 +500,18 @@ def create_api_blueprint(limiter: Limiter) -> Blueprint:
             derived_ecg=_ecg_response(result["derived_ecg"]),
             analysis=_analysis_response(result["analysis"]),
             digitization=result["digitization"],
+        ), 201
+
+    @api.post("/ecgs/<ecg_id>/derive-source")
+    @require_permission("ecg.analyze")
+    def derive_source_ecg(ecg_id: str):
+        _body(SourceDerivationRequest)
+        result = ClinicalService(current_principal()).derive_and_analyze_source(ecg_id)
+        return jsonify(
+            source_ecg_id=result["source_ecg_id"],
+            derived_ecg=_ecg_response(result["derived_ecg"]),
+            analysis=_analysis_response(result["analysis"]),
+            derivation=result["derivation"],
         ), 201
 
     @api.post("/analyses")

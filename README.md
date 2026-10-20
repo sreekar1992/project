@@ -3,6 +3,8 @@
 For the complete macOS and Windows setup, model training/export/import, local
 platform, Docker Compose, Kubernetes-boundary, verification, and troubleshooting
 guide, read [Cross-platform AI model export, import, and operations](docs/model-export-cross-platform.md).
+For a reusable AI setup prompt and a short new-laptop checklist, see
+[Use this project on another laptop](aiprompt.md).
 
 Cloud-specific deployment runbooks are separate because the current Kubernetes
 files are only scaffolding: [AWS deployment](docs/aws-deployment.md) and

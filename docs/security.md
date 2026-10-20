@@ -10,6 +10,7 @@
 - Private storage validates object keys, avoids overwriting local assets, records SHA-256 hashes, and checks hash integrity before file/PDF/explanation download.
 - New local clinical assets use application-level **AES-256-GCM** with a fresh per-object nonce and the logical object key as authenticated associated data. The local 32-byte key is created with mode `0600` under ignored `var/` storage by default, or can be directed with `LOCAL_ASSET_ENCRYPTION_KEY_PATH`. Existing plaintext local assets remain readable and are reported as legacy until a deliberate migration/re-upload.
 - S3 storage requests S3 server-side `AES256` encryption. The UI reports the actual storage posture for each authorized ECG; it does not label legacy local objects as encrypted.
+- GCS storage uses provider-managed server-side encryption. Authorized JPEG originals and generated waveform/explanation images remain private, tenant-scoped, and hash-checked on authorized reads. A non-doctor's protected image preview is a source-independent synthetic cover, never pixels from the clinical asset.
 
 ## Important limits
 
@@ -18,6 +19,8 @@ The default Flask rate limiter uses in-memory storage, even when the Compose sta
 JWT signing uses a shared-secret HS256 design and has no key rotation, issuer federation, MFA, SSO, password reset, CSRF-token design, step-up authentication, or privileged-action confirmation. The refresh cookie is HttpOnly and SameSite=Lax, but the overall browser/session model still needs a formal threat-model and CSRF review before real use.
 
 S3 object access may use presigned URLs; their bucket policy, encryption keys, logging, expiry, and network reachability must be managed outside this source code. Production starts fail if the configured bucket is absent unless an operator explicitly enables bucket creation; pre-provision it with a least-privilege identity instead. The local AES key file is a development safeguard, not a substitute for a KMS/HSM, encrypted backups, key rotation, or access governance. Do not use the legacy demonstration password or adversarial waveform camouflage for patient records.
+
+Image camouflage is **not** an encryption algorithm or safe replacement for a clinical original: a transformed image may retain patient pixels and may be partially reversible without a key. The portal therefore keeps the original under its configured encryption and RBAC policy and serves an unrelated redacted cover to users without doctor-approved visual access. It does not store a camouflaged clinical source in place of the original. Application-layer encryption for cloud objects would need approved KMS-backed key provisioning, migration, and recovery design before activation; server-side encryption must not be mislabeled as AES-GCM application-layer protection.
 
 ## Required before any real patient data
 

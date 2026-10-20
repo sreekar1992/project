@@ -172,6 +172,20 @@ class ClinicalPlatformTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         return client, {"Authorization": f"Bearer {response.get_json()['access_token']}"}
 
+    def test_duplicate_user_email_returns_conflict(self):
+        client, headers = self.client_for("superadmin@example.test")
+        hospitals = client.get("/api/v1/admin/hospitals", headers=headers)
+        self.assertEqual(hospitals.status_code, 200, hospitals.get_json())
+        organization_id = hospitals.get_json()[0]["organization_id"]
+
+        response = client.post("/api/v1/admin/users", headers=headers, json={
+            "email": "doctor@example.test", "password": PASSWORD,
+            "display_name": "Duplicate Doctor", "role": "DOCTOR",
+            "organization_id": organization_id,
+        })
+        self.assertEqual(response.status_code, 409, response.get_json())
+        self.assertEqual(response.get_json()["error"]["code"], "USER_EXISTS")
+
     def make_patient_and_encounter(self):
         client, headers = self.client_for("doctor@example.test")
         suffix = uuid.uuid4().hex[:8].upper()
@@ -350,6 +364,62 @@ class ClinicalPlatformTests(unittest.TestCase):
         analysis = client.post(f"/api/v1/ecgs/{created['id']}/analyze", headers=headers)
         self.assertEqual(analysis.status_code, 409, analysis.get_json())
         self.assertEqual(analysis.get_json()["error"]["code"], "ECG_SOURCE_ONLY")
+
+    def test_external_mat_explicit_research_derivative_preserves_encrypted_source(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        source_bytes = external_source_mat()
+        upload = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "file": (BytesIO(source_bytes), "external-source.mat"),
+        })
+        self.assertEqual(upload.status_code, 201, upload.get_json())
+        source_id = upload.get_json()["id"]
+
+        missing_ack = client.post(f"/api/v1/ecgs/{source_id}/derive-source", headers=headers, json={})
+        self.assertEqual(missing_ack.status_code, 400, missing_ack.get_json())
+
+        response = client.post(f"/api/v1/ecgs/{source_id}/derive-source", headers=headers,
+                               json={"confirm_experimental": True})
+        self.assertEqual(response.status_code, 201, response.get_json())
+        result = response.get_json()
+        derived = result["derived_ecg"]
+        self.assertNotEqual(derived["id"], source_id)
+        self.assertEqual(derived["source_kind"], "SOURCE_MAT_DERIVED_WAVEFORM")
+        self.assertEqual(derived["provenance"]["source_ecg_id"], source_id)
+        self.assertEqual(result["derivation"]["provenance"], "EXPERIMENTAL_SOURCE_MAT_RESAMPLING")
+        self.assertTrue(result["derivation"]["source_integrity_verified"])
+        self.assertIn("unverified", result["derivation"]["limitations"])
+        self.assertEqual(result["analysis"]["status"], "COMPLETED")
+        self.assertTrue(result["analysis"]["has_explanation"])
+        self.assertEqual(result["analysis"]["input_provenance"]["source_ecg_id"], source_id)
+        self.assertIn("unverified", result["analysis"]["safety"])
+        listed_analyses = client.get(f"/api/v1/analyses?patient_id={patient_id}", headers=headers)
+        self.assertEqual(listed_analyses.status_code, 200, listed_analyses.get_json())
+        self.assertEqual(listed_analyses.get_json()[0]["input_provenance"]["source_ecg_id"], source_id)
+        self.assertEqual(client.get(f"/api/v1/ecgs/{source_id}", headers=headers).get_json()["status"], "SOURCE_ONLY")
+        self.assertEqual(client.get(f"/api/v1/ecgs/{source_id}/file", headers=headers).data, source_bytes)
+
+        with self.app.app_context():
+            session = get_session()
+            derived_file = session.scalar(select(ECGFile).where(ECGFile.ecg_uuid == uuid.UUID(derived["id"])))
+            self.assertIsNotNone(derived_file)
+            self.assertEqual(derived_file.purpose, "DERIVED_FROM_SOURCE_MAT")
+            stored_bytes = (self.root / "private_objects" / derived_file.object_key).read_bytes()
+            self.assertTrue(stored_bytes.startswith(b"ECG-CLINICAL-AESGCM-1\x00"))
+            analysis = session.get(AIAnalysis, uuid.UUID(result["analysis"]["id"]))
+            self.assertEqual(analysis.raw_output["input_provenance"]["source_ecg_id"], source_id)
+
+    def test_external_mat_research_derivative_rejects_inadequate_duration(self):
+        client, headers, patient_id, encounter_id = self.make_patient_and_encounter()
+        upload = client.post("/api/v1/ecgs", headers=headers, data={
+            "patient_id": patient_id, "encounter_id": encounter_id,
+            "file": (BytesIO(external_source_mat(500)), "too-short.mat"),
+        })
+        self.assertEqual(upload.status_code, 201, upload.get_json())
+        response = client.post(f"/api/v1/ecgs/{upload.get_json()['id']}/derive-source", headers=headers,
+                               json={"confirm_experimental": True})
+        self.assertEqual(response.status_code, 422, response.get_json())
+        self.assertEqual(response.get_json()["error"]["code"], "SOURCE_DERIVATION_REJECTED")
 
     def test_external_source_flag_rejects_incomplete_mat(self):
         client, headers, patient_id, encounter_id = self.make_patient_and_encounter()

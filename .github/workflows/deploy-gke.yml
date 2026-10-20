@@ -71,6 +71,14 @@ jobs:
           location: ${{ env.GKE_LOCATION }}
           project_id: ${{ env.PROJECT_ID }}
 
+      - name: Test external MAT analysis in the release image
+        run: |
+          docker run --rm \
+            --mount "type=bind,src=${GITHUB_WORKSPACE}/tests,dst=/tests,readonly" \
+            --env PYTHONPATH=/app/src \
+            "${API_IMAGE}" \
+            python -m unittest discover -s /tests -p test_clinical_platform.py -k external_mat
+
       - name: Check cluster prerequisites
         run: |
           set -euo pipefail

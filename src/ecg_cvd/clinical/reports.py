@@ -220,10 +220,11 @@ def _identity_card(*, patient_name: str, empi_id: str, mrn: str, encounter_numbe
 
 
 def _waveform_card(waveform_png: bytes | None, styles: dict[str, ParagraphStyle],
-                   content_width: float) -> Table:
+                   content_width: float, experimental_derivative: bool = False) -> Table:
     caption = Paragraph(
-        "Authorized source-recording visualization for clinician review. This image is not an AI diagnosis, "
-        "disease probability, or treatment recommendation.",
+        ("Experimental derived waveform visualization, not a verified raw ECG acquisition. "
+         if experimental_derivative else "Authorized source-recording visualization for clinician review. ")
+        + "This image is not an AI diagnosis, disease probability, or treatment recommendation.",
         styles["caption"],
     )
     table_style = [
@@ -348,7 +349,8 @@ def build_ecg_report_pdf(*, hospital: str, patient_name: str, empi_id: str, mrn:
                          ai_prediction: str | None, ai_score: float | None, model_version: str | None,
                          clinician_assessment: str | None, diagnosis: str | None,
                          prescription_items: list[dict[str, str | None]],
-                         waveform_png: bytes | None = None) -> bytes:
+                         waveform_png: bytes | None = None,
+                         input_provenance_note: str | None = None) -> bytes:
     """Render a printable, research-only clinical review PDF.
 
     ``prescription_items`` is clinician-authored structured data. The model is
@@ -384,7 +386,7 @@ def build_ecg_report_pdf(*, hospital: str, patient_name: str, empi_id: str, mrn:
         Spacer(1, 1 * mm),
         Paragraph("AUTHORIZED CLINICAL REVIEW RECORD", styles["eyebrow"]),
         Paragraph(
-            "This report combines the authorized source-recording visualization, a research-only model observation, "
+            "This report combines an authorized waveform visualization, a research-only model observation, "
             "and clinician-entered documentation. It is intended for qualified clinician review.",
             styles["intro"],
         ),
@@ -393,9 +395,11 @@ def build_ecg_report_pdf(*, hospital: str, patient_name: str, empi_id: str, mrn:
             accession_number=accession_number, clinician=clinician, styles=styles, content_width=content_width,
         ),
         Spacer(1, 4 * mm),
-        _section_heading("ECG waveform - source-recording visualization", styles, content_width),
+        _section_heading("ECG waveform - research derivative" if input_provenance_note else
+                         "ECG waveform - source-recording visualization", styles, content_width),
         Spacer(1, 2 * mm),
-        _waveform_card(waveform_png, styles, content_width),
+        _waveform_card(waveform_png, styles, content_width,
+                       experimental_derivative=bool(input_provenance_note)),
         Spacer(1, 4 * mm),
         _section_heading("AI research/CDS observation", styles, content_width),
         Spacer(1, 2 * mm),
@@ -403,6 +407,9 @@ def build_ecg_report_pdf(*, hospital: str, patient_name: str, empi_id: str, mrn:
             prediction=ai_prediction, score=ai_score, model_version=model_version,
             styles=styles, content_width=content_width,
         ),
+        *([Spacer(1, 2 * mm), Paragraph(
+            f"<b>Experimental input:</b> {_paragraph_text(input_provenance_note)}", styles["safety"],
+        )] if input_provenance_note else []),
         Spacer(1, 4 * mm),
         KeepTogether([
             _section_heading("Clinical review", styles, content_width),

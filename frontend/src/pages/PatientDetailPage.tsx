@@ -44,7 +44,7 @@ import { ProtectedEcgPreview } from "../components/ProtectedEcgPreview";
 import { DoctorVisualAccessInbox, VisualAccessRequestPanel, visualAccessEcgId, visualAccessRequestId } from "../components/VisualAccessControls";
 import { useAuth } from "../lib/auth";
 import { api, hasCurrentVisualAccessGrant } from "../lib/api";
-import { listFromResponse, patientDisplayName, type Analysis, type EcgDigitizationResult, type EcgRecord, type EcgSecurityStatus, type EcgVisualAccessApproval, type EcgVisualAccessGrant, type EcgVisualAccessRequest, type MedicineSuggestion } from "../types/api";
+import { listFromResponse, patientDisplayName, type Analysis, type EcgDigitizationResult, type EcgRecord, type EcgSecurityStatus, type EcgSourceDerivationResult, type EcgVisualAccessApproval, type EcgVisualAccessGrant, type EcgVisualAccessRequest, type MedicineSuggestion } from "../types/api";
 
 const encounterSchema = z.object({
   encounter_type: z.string().trim().min(1, "Choose an encounter type."),
@@ -121,6 +121,11 @@ function isSourceOnlyEcg(record: Pick<EcgRecord, "source_kind" | "status">): boo
 function isDigitizedEcg(record: Pick<EcgRecord, "source_kind" | "provenance">): boolean {
   const provenanceKind = typeof record.provenance === "string" ? record.provenance : record.provenance?.kind;
   return record.source_kind === "JPEG_DIGITIZED_WAVEFORM" || provenanceKind === "EXPERIMENTAL_JPEG_TRACE_DIGITIZATION";
+}
+
+function isSourceDerivedEcg(record: Pick<EcgRecord, "source_kind" | "provenance">): boolean {
+  const provenanceKind = typeof record.provenance === "string" ? record.provenance : record.provenance?.kind;
+  return record.source_kind === "SOURCE_MAT_DERIVED_WAVEFORM" || provenanceKind === "EXPERIMENTAL_SOURCE_MAT_RESAMPLING";
 }
 
 function ecgFilename(ecg: Pick<EcgRecord, "filename" | "source_filename" | "id">): string {
@@ -396,6 +401,9 @@ export function PatientDetailPage() {
   const [digitizationOutputFormat, setDigitizationOutputFormat] = useState<"csv" | "mat">("csv");
   const [confirmExperimentalDigitization, setConfirmExperimentalDigitization] = useState(false);
   const [recentDigitization, setRecentDigitization] = useState<EcgDigitizationResult | null>(null);
+  const [sourceDerivationEcgId, setSourceDerivationEcgId] = useState("");
+  const [confirmSourceDerivation, setConfirmSourceDerivation] = useState(false);
+  const [recentSourceDerivation, setRecentSourceDerivation] = useState<EcgSourceDerivationResult | null>(null);
   const securityEcgId = viewerEcgId || imageViewerEcgId || protectedPreviewEcgId;
   // Keep the client affordance aligned with the server RBAC policy: the
   // platform-wide SUPER_ADMIN role has the wildcard permission that includes
@@ -465,6 +473,7 @@ export function PatientDetailPage() {
     setVisualAccessApproval(undefined);
     setAutoAnalysisEcgId("");
     setRecentUpload(null);
+    setRecentSourceDerivation(null);
   }, [patientId]);
 
   useEffect(() => {
@@ -593,6 +602,20 @@ export function PatientDetailPage() {
       setConfirmExperimentalDigitization(false);
     },
   });
+  const deriveSourceEcg = useMutation({
+    mutationFn: () => {
+      if (!sourceDerivationEcgId) throw new Error("Choose an external source MAT before requesting research analysis.");
+      return api.ecgs.deriveSource(sourceDerivationEcgId);
+    },
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({ queryKey: ["ecgs", patientId] });
+      void queryClient.invalidateQueries({ queryKey: ["analyses", patientId] });
+      setRecentSourceDerivation(result);
+      setAnalysisEcg(result.derived_ecg.id);
+      setSourceDerivationEcgId("");
+      setConfirmSourceDerivation(false);
+    },
+  });
   const submitReview = useMutation({
     mutationFn: (values: ReviewValues) => api.reviews.create({
       analysis_id: values.analysis_id,
@@ -665,6 +688,7 @@ export function PatientDetailPage() {
     ?? (recentDigitization?.derived_ecg.id === protectedPreviewEcgId ? recentDigitization.derived_ecg : undefined)
     ?? (recentUpload?.id === protectedPreviewEcgId ? recentUpload : undefined);
   const digitizationSourceEcg = ecgItems.find((ecg) => ecg.id === digitizationEcgId);
+  const sourceOnlyEcgItems = ecgItems.filter(isSourceOnlyEcg);
   const waveformEcgItems = ecgItems.filter((ecg) => !isEcgImage(ecg) && !isSourceOnlyEcg(ecg));
   const selectedFileIsImage = /\.(jpe?g)$/i.test(selectedFile?.name ?? "");
   const selectedFileIsMat = /\.mat$/i.test(selectedFile?.name ?? "");
@@ -723,7 +747,7 @@ export function PatientDetailPage() {
                   {selectedFileIsImage
                     ? "JPEG ECG image selected. It will be retained for authorized visual review; raw-waveform prediction requires a .mat or .csv recording."
                     : selectedFileIsMat
-                      ? "For authorized clinical roles, a MAT waveform passing the 3,600-sample input check automatically requests research analysis. Verify the lead and 360 Hz acquisition separately. External 'sinalf1'/'TEMPO1' files remain view-only; no upload provides clinical clearance."
+                      ? "For authorized clinical roles, a MAT waveform passing the 3,600-sample input check automatically requests research analysis. Verify the lead and 360 Hz acquisition separately. External 'sinalf1'/'TEMPO1' files remain source-only unless a separate experimental derivative is explicitly requested."
                     : "Waveform file selected. The server requires one 3,600-sample ECG signal (10 seconds at 360 Hz) before it can store and analyze the recording."}
                 </Alert>
               )}
@@ -731,7 +755,7 @@ export function PatientDetailPage() {
               {recentUpload?.id === autoAnalysisEcgId && requestAnalysis.isPending && <Alert severity="info">Compatible MAT uploaded. Research analysis is being requested; a clinician must review the result.</Alert>}
               {recentUpload?.id === autoAnalysisEcgId && requestAnalysis.isError && <ApiErrorAlert error={requestAnalysis.error} />}
               {recentUpload?.id === autoAnalysisEcgId && requestAnalysis.data && <Alert severity="info">Research analysis {(recentUploadAnalysis?.status ?? requestAnalysis.data.status ?? "requested").toLowerCase()}. Check the AI research analyses section below; this is not clinical clearance.</Alert>}
-              {recentUpload && isSourceOnlyEcg(recentUpload) && <Alert severity="info">Stored as an external ECG source for authorized viewing only. No AI analysis or clinical clearance was performed.</Alert>}
+              {recentUpload && isSourceOnlyEcg(recentUpload) && <Alert severity="info">Stored as an external ECG source. No automatic AI analysis or clinical clearance was performed. Use the separate experimental action below only for research.</Alert>}
               {recentUpload && <RecentUploadProtection ecgId={recentUpload.id} filename={ecgFilename(recentUpload)} />}
             </Stack>
           </Paper>
@@ -752,14 +776,15 @@ export function PatientDetailPage() {
                     <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
                       <Typography fontWeight={700}>{ecgFilename(ecg)}</Typography>
                       {isImage && <Chip size="small" label="JPEG source image" color="info" variant="outlined" />}
-                      {isSourceOnlyEcg(ecg) && <Chip size="small" label="Source only · no AI analysis" color="info" variant="outlined" />}
+                      {isSourceOnlyEcg(ecg) && <Chip size="small" label="Source only · no direct AI analysis" color="info" variant="outlined" />}
                       {isDigitizedEcg(ecg) && <Chip size="small" label="Experimental JPEG-derived waveform" color="warning" variant="outlined" />}
+                      {isSourceDerivedEcg(ecg) && <Chip size="small" label="Experimental source-MAT derivative" color="warning" variant="outlined" />}
                     </Stack>
                     <Typography variant="body2" color="text.secondary">Uploaded/acquired: {formatDate(ecg.acquired_at ?? ecg.created_at)} · Status: {ecg.status ?? "unknown"}</Typography>
                     {isImage && <Typography variant="caption" color="text.secondary">This source image is never sent directly to RAMNV2. An authorized user may explicitly create a separate experimental numerical derivative.</Typography>}
-                    {isSourceOnlyEcg(ecg) && <Typography variant="caption" color="text.secondary">Original MAT retained for authorized viewing and download. The source duration supports the display time axis; the acquisition sampling rate and lead are unverified.</Typography>}
+                    {isSourceOnlyEcg(ecg) && <Typography variant="caption" color="text.secondary">Original MAT retained for authorized viewing and download. Acquisition rate and lead are unverified; an optional, separate research derivative can be analyzed.</Typography>}
                     {isDigitizedEcg(ecg) && <Typography variant="caption" color="warning.dark">Derived from a JPEG trace extraction. Treat waveform and score as research artifacts requiring clinician review.</Typography>}
-                    {!canViewOriginalEcg && !canRenderThisEcg && <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.4 }}>Original ECG pixels and waveform values are locked for this role. Only a non-clinical protected camouflage preview is available until a doctor approves a temporary visual grant.</Typography>}
+                    {!canViewOriginalEcg && !canRenderThisEcg && <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.4 }}>Original ECG pixels and waveform values are locked for this role. Only a source-independent redacted cover preview is available until a doctor approves a temporary visual grant.</Typography>}
                     {!canViewOriginalEcg && canRenderThisEcg && <Typography variant="caption" color="success.dark" sx={{ display: "block", mt: 0.4 }}>Temporary doctor-approved visual access is active until {formatDate(temporaryGrant?.expires_at)}. It is view-only and cannot be downloaded.</Typography>}
                   </Box>
                   <RecordingSecurityStatus ecgId={ecg.id} />
@@ -787,6 +812,11 @@ export function PatientDetailPage() {
                         }}
                       >
                         Convert &amp; analyze
+                      </Button>
+                    )}
+                    {isSourceOnlyEcg(ecg) && canUseResearchModel && (
+                      <Button size="small" color="warning" startIcon={<AutoGraphOutlinedIcon />} onClick={() => { deriveSourceEcg.reset(); setSourceDerivationEcgId(ecg.id); setConfirmSourceDerivation(false); }}>
+                        Experimental analyze
                       </Button>
                     )}
                     {canViewOriginalEcg ? (
@@ -874,6 +904,37 @@ export function PatientDetailPage() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      <Dialog
+        open={Boolean(sourceDerivationEcgId)}
+        onClose={() => { if (!deriveSourceEcg.isPending) setSourceDerivationEcgId(""); }}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>Experimental source-MAT analysis</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2} sx={{ pt: 0.5 }}>
+            <Alert severity="warning">
+              A 10-second window from this source MAT will be resampled to the research model&apos;s input length. The rate is inferred from sample count and TEMPO1 duration; lead identity, acquisition rate, and cross-dataset validity are unverified. The result is not a diagnosis or clinical clearance.
+            </Alert>
+            <Alert severity="info">The original encrypted MAT is not changed. A separately encrypted derivative and an auditable research analysis are created.</Alert>
+            <FormControlLabel control={<Checkbox checked={confirmSourceDerivation} onChange={(event) => setConfirmSourceDerivation(event.target.checked)} />} label="I understand this is an experimental, unvalidated source-MAT conversion for research only." />
+            {deriveSourceEcg.isError && <ApiErrorAlert error={deriveSourceEcg.error} />}
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, py: 2 }}>
+          <Button disabled={deriveSourceEcg.isPending} onClick={() => setSourceDerivationEcgId("")}>Cancel</Button>
+          <Button variant="contained" color="warning" disabled={!confirmSourceDerivation || deriveSourceEcg.isPending} onClick={() => deriveSourceEcg.mutate()}>
+            {deriveSourceEcg.isPending ? "Converting & analyzing…" : "Create derivative & analyze"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {recentSourceDerivation && (
+        <Alert severity="warning">
+          Experimental source-MAT analysis completed: {analysisLabel(recentSourceDerivation.analysis.predicted_label ?? recentSourceDerivation.analysis.prediction_label)}. {recentSourceDerivation.derivation.limitations}
+        </Alert>
+      )}
 
       {recentDigitization && (
         <Paper sx={{ p: 2.5, borderColor: "warning.light", bgcolor: "rgba(237, 108, 2, 0.035)" }}>
@@ -1038,10 +1099,22 @@ export function PatientDetailPage() {
                 <InputLabel id="analysis-ecg-label">ECG recording</InputLabel>
                 <Select labelId="analysis-ecg-label" label="ECG recording" value={analysisEcg} onChange={(event) => setAnalysisEcg(event.target.value)}>
                   <MenuItem value=""><em>Choose a .mat or .csv recording</em></MenuItem>
-                  {waveformEcgItems.map((ecg) => <MenuItem key={ecg.id} value={ecg.id}>{ecgFilename(ecg)}{isDigitizedEcg(ecg) ? " · experimental JPEG-derived waveform" : ""}</MenuItem>)}
+                  {waveformEcgItems.map((ecg) => <MenuItem key={ecg.id} value={ecg.id}>{ecgFilename(ecg)}{isDigitizedEcg(ecg) ? " · experimental JPEG-derived waveform" : isSourceDerivedEcg(ecg) ? " · experimental source-MAT derivative" : ""}</MenuItem>)}
                 </Select>
               </FormControl>
-              {!waveformEcgItems.length && <Typography variant="caption" color="text.secondary">Upload a native .mat or .csv waveform, or explicitly create an experimental numerical derivative from a JPEG source image before requesting analysis.</Typography>}
+              {!waveformEcgItems.length && <Typography variant="caption" color="text.secondary">No model-compatible waveform is ready. A source-only MAT needs a separate experimental derivative; a JPEG needs experimental trace digitization.</Typography>}
+              {sourceOnlyEcgItems.length > 0 && canUseResearchModel && (
+                <Alert severity="info">
+                  <Typography variant="body2">Source-only MAT recordings are not analyzed on upload. Choose one below to review the experimental conversion and run research analysis.</Typography>
+                  <Stack spacing={0.5} sx={{ mt: 1 }}>
+                    {sourceOnlyEcgItems.map((ecg) => (
+                      <Button key={ecg.id} size="small" color="warning" sx={{ alignSelf: "flex-start" }} onClick={() => { deriveSourceEcg.reset(); setSourceDerivationEcgId(ecg.id); setConfirmSourceDerivation(false); }}>
+                        Experimental analyze {ecgFilename(ecg)}
+                      </Button>
+                    ))}
+                  </Stack>
+                </Alert>
+              )}
               <Button variant="contained" startIcon={<PlayCircleOutlineOutlinedIcon />} onClick={() => requestAnalysis.mutate(analysisEcg)} disabled={!analysisEcg || requestAnalysis.isPending}>{requestAnalysis.isPending ? "Requesting…" : "Request analysis"}</Button>
             </Stack>
           </Paper>
@@ -1064,12 +1137,14 @@ export function PatientDetailPage() {
                           <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
                             <Typography fontWeight={700}>{analysisLabel(analysis.predicted_label ?? analysis.prediction_label)}</Typography>
                             {analysis.ecg_id && isDigitizedEcg(ecgItems.find((ecg) => ecg.id === analysis.ecg_id) ?? {}) && <Chip size="small" color="warning" variant="outlined" label="Experimental JPEG-derived input" />}
+                            {analysis.ecg_id && isSourceDerivedEcg(ecgItems.find((ecg) => ecg.id === analysis.ecg_id) ?? {}) && <Chip size="small" color="warning" variant="outlined" label="Experimental source-MAT input" />}
                           </Stack>
                           <Typography variant="body2" color="text.secondary">Model: {analysis.model_version ?? "not returned"} · {formatDate(analysis.created_at)}</Typography>
                         </Box>
                         <Chip size="small" label={analysis.status ?? "pending clinician review"} color="warning" variant="outlined" />
                       </Stack>
                       {confidence !== undefined && <Box sx={{ mt: 1.5 }}><Stack direction="row" justifyContent="space-between"><Typography variant="caption">Uncalibrated model score</Typography><Typography variant="caption">{confidence}%</Typography></Stack><LinearProgress variant="determinate" value={confidence} sx={{ mt: 0.5, height: 7, borderRadius: 10 }} /></Box>}
+                      {analysis.input_provenance?.limitations && <Alert severity="warning" sx={{ mt: 1.5 }}>{analysis.input_provenance.limitations}</Alert>}
                       <Stack direction="row" spacing={1} sx={{ mt: 1.5 }}>
                         {analysis.ecg_id && canViewOriginalEcg && <Button size="small" onClick={() => { setViewerEcgId(analysis.ecg_id!); setProtectedPreviewEcgId(""); }}>View waveform</Button>}
                         {analysis.ecg_id && canViewOriginalEcg && analysis.has_explanation && <Button size="small" onClick={() => setExplanationEcgId(analysis.ecg_id!)}>View Grad-CAM</Button>}

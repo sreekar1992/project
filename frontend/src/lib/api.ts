@@ -7,6 +7,7 @@ import type {
   ConfiguredResearchModel,
   DashboardResponse,
   EcgDigitizationResult,
+  EcgSourceDerivationResult,
   EcgRecord,
   EcgSecurityStatus,
   EcgVisualAccessApproval,
@@ -325,6 +326,10 @@ export const api = {
     digitize: (ecgId: string, values: { output_format: "csv" | "mat"; confirm_experimental: true }) => request<EcgDigitizationResult>(
       `/ecgs/${encodeURIComponent(ecgId)}/digitize`,
       { method: "POST", body: values },
+    ),
+    deriveSource: (ecgId: string) => request<EcgSourceDerivationResult>(
+      `/ecgs/${encodeURIComponent(ecgId)}/derive-source`,
+      { method: "POST", body: { confirm_experimental: true } },
     ),
   },
   analyses: {

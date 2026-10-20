@@ -17,7 +17,24 @@ It accepts numerical waveform files, not raster ECG images. The clinical upload 
 
 For the [ECG COVID-19 severity dataset](https://data.mendeley.com/datasets/cy8b8kvfdf/1), upload a `.mat` file normally. The server recognizes a finite, one-vector `sinalf1` signal and a positive `TEMPO1` duration and automatically imports it as source-only, even when the request does not set `source_only=true`. It preserves the original file unchanged in private storage, records a SHA-256 checksum, and makes the waveform available to authorized viewers. A doctor may download the original; other scoped users need a temporary doctor-approved visual grant. The time axis uses the source duration, not a verified acquisition sampling rate. Lead identity and amplitude calibration are not asserted.
 
-Source-only records have status `SOURCE_ONLY` and are excluded from the analysis selector; the analysis API also rejects them with `ECG_SOURCE_ONLY` (409). No resampling, model inference, diagnosis, treatment recommendation, or clinical clearance is performed. Ordinary model-compatible `.mat` uploads continue to use the existing 3,600-sample validation path. Other ECG-machine MAT layouts need a separately implemented and validated importer; the `.mat` extension alone does not establish lead identity, timing, units, or model compatibility.
+Source-only records have status `SOURCE_ONLY` and are excluded from direct analysis; `POST /ecgs/{id}/analyze` still rejects them with `ECG_SOURCE_ONLY` (409). No inference is performed on upload. Ordinary model-compatible `.mat` uploads continue to use the existing 3,600-sample validation path. Other ECG-machine MAT layouts need a separately implemented and validated importer; the `.mat` extension alone does not establish lead identity, timing, units, or model compatibility.
+
+### Explicit external-MAT research derivative
+
+An authorized research-model user may choose **Experimental analyze** for a readable `sinalf1`/`TEMPO1` source record and acknowledge the warning:
+
+```http
+POST /api/v1/ecgs/{source-ecg-id}/derive-source
+Content-Type: application/json
+
+{"confirm_experimental": true}
+```
+
+The server verifies the original asset hash, checks for at least 10 seconds and an inferred 50–2,000 samples/second, takes the **first** 10 seconds, resamples that window to 3,600 samples, and validates the resulting MAT through the normal numerical-input parser. It stores a new, separately encrypted record with `SOURCE_MAT_DERIVED_WAVEFORM` source kind, source linkage, SHA-256, audit events, and `EXPERIMENTAL_SOURCE_MAT_RESAMPLING` provenance. Only that derivative is sent to RAMNV2. The original remains unchanged and source-only.
+
+The rate is **inferred** from sample count divided by `TEMPO1` duration; neither the acquisition rate nor lead identity is verified. The result is a cross-dataset research experiment with uncalibrated scores, **not** validated analysis of every MAT, a diagnosis, or clinical clearance. Missing fields, short/flat signals, unsupported layouts, or failed numerical validation are rejected without a model prediction. No image or source-only MAT is silently classified on upload.
+
+Analysis responses retain the derivative's source ID and limitations after refresh. The patient portal displays the experimental warning with its score, and generated PDF reports identify the waveform as a research derivative rather than a raw acquisition.
 
 ## Analysis lifecycle
 

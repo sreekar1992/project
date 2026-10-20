@@ -120,7 +120,7 @@ export interface EcgRecord {
   created_at?: string;
   waveform_url?: string;
   content_type?: string;
-  source_kind?: "WAVEFORM" | "ECG_IMAGE" | "JPEG_DIGITIZED_WAVEFORM" | "EXTERNAL_ECG_SOURCE" | string;
+  source_kind?: "WAVEFORM" | "ECG_IMAGE" | "JPEG_DIGITIZED_WAVEFORM" | "EXTERNAL_ECG_SOURCE" | "SOURCE_MAT_DERIVED_WAVEFORM" | string;
   source_ecg_id?: Identifier;
   provenance?: string | {
     kind?: string;
@@ -243,6 +243,8 @@ export interface Analysis {
   model_version?: string;
   has_explanation?: boolean;
   top_predictions?: Array<{ rank?: number; label?: string; label_name?: string; score?: number }>;
+  input_provenance?: { kind?: string; limitations?: string; source_ecg_id?: Identifier } | null;
+  safety?: string;
   created_at?: string;
   reviewed_at?: string;
   [key: string]: unknown;
@@ -288,6 +290,21 @@ export interface EcgDigitizationResult {
     output_format: "csv" | "mat" | string;
     provenance: string;
     quality?: Record<string, string | number | boolean | null>;
+    limitations: string;
+  };
+}
+
+export interface EcgSourceDerivationResult {
+  source_ecg_id: Identifier;
+  derived_ecg: EcgRecord;
+  analysis: Analysis;
+  derivation: {
+    status: string;
+    provenance: string;
+    inferred_sampling_rate_hz: number;
+    source_samples_used: number;
+    start_seconds: number;
+    source_integrity_verified: boolean;
     limitations: string;
   };
 }

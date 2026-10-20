@@ -78,6 +78,10 @@ class ImageDigitizationRequest(APIModel):
     output_format: Literal["csv", "mat"] = "csv"
 
 
+class SourceDerivationRequest(APIModel):
+    confirm_experimental: Literal[True]
+
+
 class VisualAccessUnlockRequest(APIModel):
     """One doctor-issued passcode for a single ECG visual session."""
 

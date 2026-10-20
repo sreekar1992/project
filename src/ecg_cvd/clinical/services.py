@@ -28,7 +28,7 @@ from .db import get_session
 from .image_digitization import (OUTPUT_SAMPLING_RATE_HZ, DigitizedTrace,
                                  digitize_ecg_jpeg)
 from .image_validation import validate_jpeg_image
-from .source_ecg import read_source_ecg
+from .source_ecg import derive_research_segment, read_source_ecg
 from ..crypto import decrypt_password, encrypt_password
 from .models import (AIAnalysis, AIModel, AIModelVersion, AIPrediction, AuditEvent, ClinicalNote,
                      Condition, DiagnosticReport, DoctorReview, ECGFile, ECGRecord, ECGVisualAccessGrant,
@@ -80,6 +80,9 @@ JPEG_CONTENT_TYPE = "image/jpeg"
 DIGITIZED_FILE_PURPOSE = "DERIVED_FROM_JPEG"
 DIGITIZED_DEVICE_PREFIX = "EXPERIMENTAL_JPEG_TRACE:"
 DIGITIZATION_PROVENANCE = "EXPERIMENTAL_JPEG_TRACE_DIGITIZATION"
+SOURCE_DERIVED_FILE_PURPOSE = "DERIVED_FROM_SOURCE_MAT"
+SOURCE_DERIVED_DEVICE_PREFIX = "EXPERIMENTAL_SOURCE_MAT:"
+SOURCE_DERIVATION_PROVENANCE = "EXPERIMENTAL_SOURCE_MAT_RESAMPLING"
 ORIGINAL_ECG_VIEW_ROLE = "DOCTOR"
 VISUAL_ACCESS_PENDING = "PENDING"
 VISUAL_ACCESS_APPROVED = "APPROVED"
@@ -719,13 +722,24 @@ class ClinicalService:
             return None
 
     @staticmethod
+    def _derived_source_mat_id(ecg: ECGRecord) -> str | None:
+        if not ecg.device_id or not ecg.device_id.startswith(SOURCE_DERIVED_DEVICE_PREFIX):
+            return None
+        try:
+            return str(uuid.UUID(ecg.device_id.removeprefix(SOURCE_DERIVED_DEVICE_PREFIX)))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def ecg_dict(ecg: ECGRecord) -> dict[str, Any]:
         image_only = ecg.status == "IMAGE_ONLY"
         source_only = ecg.status == "SOURCE_ONLY"
         source_ecg_id = ClinicalService._digitized_source_ecg_id(ecg)
+        source_mat_id = ClinicalService._derived_source_mat_id(ecg)
         source_kind = ("ECG_IMAGE" if image_only else
                        "EXTERNAL_ECG_SOURCE" if source_only else
-                       "JPEG_DIGITIZED_WAVEFORM" if source_ecg_id else "WAVEFORM")
+                       "JPEG_DIGITIZED_WAVEFORM" if source_ecg_id else
+                       "SOURCE_MAT_DERIVED_WAVEFORM" if source_mat_id else "WAVEFORM")
         result: dict[str, Any] = {
             "ecg_uuid": str(ecg.ecg_uuid), "patient_uuid": str(ecg.patient_uuid),
             "encounter_uuid": str(ecg.encounter_uuid), "accession_number": ecg.accession_number,
@@ -739,6 +753,12 @@ class ClinicalService:
             result["provenance"] = {
                 "kind": DIGITIZATION_PROVENANCE,
                 "source_ecg_id": source_ecg_id,
+                "research_only": True,
+            }
+        if source_mat_id:
+            result["provenance"] = {
+                "kind": SOURCE_DERIVATION_PROVENANCE,
+                "source_ecg_id": source_mat_id,
                 "research_only": True,
             }
         return result
@@ -779,12 +799,12 @@ class ClinicalService:
             raise APIError("ROLE_NOT_FOUND", "The requested role is unavailable.", 400)
         user = User(organization_id=target_org, patient_id=patient_uuid, email=payload.email.lower(),
                     password_hash=generate_password_hash(payload.password), display_name=payload.display_name)
-        self.session.add(user)
-        self.session.flush()
-        self.session.add(UserRole(user_id=user.user_id, role_id=role.role_id, organization_id=target_org))
-        if payload.role in {"DOCTOR", "TECHNICIAN"}:
-            self.session.add(Practitioner(user_id=user.user_id, organization_id=target_org))
         try:
+            self.session.add(user)
+            self.session.flush()
+            self.session.add(UserRole(user_id=user.user_id, role_id=role.role_id, organization_id=target_org))
+            if payload.role in {"DOCTOR", "TECHNICIAN"}:
+                self.session.add(Practitioner(user_id=user.user_id, organization_id=target_org))
             self.session.commit()
         except IntegrityError as exc:
             self.session.rollback()
@@ -1137,13 +1157,106 @@ class ClinicalService:
             },
         }
 
+    def derive_and_analyze_source(self, source_ecg_uuid: str) -> dict[str, Any]:
+        """Analyze a separate, unvalidated research derivative of one source MAT."""
+        source = self._ecg(source_ecg_uuid)
+        source_file = self._file_for_ecg(source)
+        if source.status != "SOURCE_ONLY" or Path(source_file.original_filename).suffix.lower() != ".mat":
+            raise APIError("SOURCE_MAT_REQUIRED", "Choose an external source-only MAT recording.", 409)
+        if self.adapter is None:
+            raise APIError("MODEL_CONFIGURATION_ERROR", "No compatible ECG model artifact is configured.", 503)
+        source_bytes = self.storage.get_bytes(source_file.object_key)
+        if hashlib.sha256(source_bytes).hexdigest() != source_file.sha256:
+            raise APIError("ASSET_INTEGRITY_ERROR", "The source ECG failed an integrity check.", 500)
+        try:
+            segment = derive_research_segment(read_source_ecg(source_bytes))
+        except ValueError as exc:
+            raise APIError("SOURCE_DERIVATION_REJECTED", str(exc), 422) from exc
+        output = BytesIO()
+        savemat(output, {"val": segment.waveform.reshape(1, -1)})
+        derived_bytes = output.getvalue()
+        derived_filename = f"research-window-from-{source_file.ecg_file_id}.mat"
+        try:
+            validated = self.adapter.validate(derived_bytes, derived_filename)
+        except (ValueError, TypeError, OSError) as exc:
+            raise APIError("SOURCE_DERIVATION_REJECTED", "The derived waveform did not meet model input validation.", 422) from exc
+        if validated.size != 3_600:
+            raise APIError("SOURCE_DERIVATION_REJECTED", "The derived waveform must contain 3,600 samples.", 422)
+
+        derived = ECGRecord(
+            patient_uuid=source.patient_uuid,
+            encounter_uuid=source.encounter_uuid,
+            organization_id=source.organization_id,
+            accession_number=f"ECG-SRC-{uuid.uuid4().hex[:12].upper()}",
+            device_id=f"{SOURCE_DERIVED_DEVICE_PREFIX}{source.ecg_uuid}",
+            sampling_rate=360.0,
+            lead_count=1,
+            duration_seconds=10.0,
+            status="READY",
+        )
+        self.session.add(derived)
+        self.session.flush()
+        object_key = (f"organizations/{source.organization_id}/ecgs/{derived.ecg_uuid}/"
+                      f"derived/source-mat/{uuid.uuid4().hex}.mat")
+        stored = self.storage.put_bytes(object_key, derived_bytes, "application/x-matlab-data")
+        self.session.add(ECGFile(
+            ecg_uuid=derived.ecg_uuid,
+            storage_uri=stored.uri,
+            object_key=stored.object_key,
+            sha256=stored.sha256,
+            content_type=stored.content_type,
+            original_filename=derived_filename,
+            size_bytes=stored.size_bytes,
+            purpose=SOURCE_DERIVED_FILE_PURPOSE,
+        ))
+        self.session.commit()
+        audit("ECG_SOURCE_DERIVED", "ecg", str(derived.ecg_uuid), organization_id=derived.organization_id,
+              metadata={"provenance": SOURCE_DERIVATION_PROVENANCE, "source_ecg_id": str(source.ecg_uuid)})
+        self.session.commit()
+
+        analysis = self.create_analysis(str(derived.ecg_uuid))
+        completed = self.run_analysis(analysis.ai_analysis_uuid)
+        limitations = (
+            "The first 10 seconds were resampled using a rate inferred from source sample count and TEMPO1 duration. "
+            "Acquisition rate, lead identity, amplitude calibration, and cross-dataset model validity are unverified. "
+            "This result is experimental research only, not a diagnosis, treatment recommendation, or clinical clearance."
+        )
+        raw_output = dict(completed.raw_output or {})
+        raw_output["input_provenance"] = {
+            "kind": SOURCE_DERIVATION_PROVENANCE,
+            "source_ecg_id": str(source.ecg_uuid),
+            "source_file_sha256": source_file.sha256,
+            "derived_file_sha256": stored.sha256,
+            "inferred_sampling_rate_hz": segment.inferred_sampling_rate_hz,
+            "source_samples_used": segment.source_samples_used,
+            "start_seconds": segment.start_seconds,
+            "limitations": limitations,
+        }
+        completed.raw_output = raw_output
+        self.session.commit()
+        audit("ECG_SOURCE_DERIVATION_ANALYZED", "ai_analysis", str(completed.ai_analysis_uuid),
+              organization_id=derived.organization_id,
+              metadata={"provenance": SOURCE_DERIVATION_PROVENANCE, "source_ecg_id": str(source.ecg_uuid)})
+        self.session.commit()
+        return {
+            "source_ecg_id": str(source.ecg_uuid),
+            "derived_ecg": {**self.ecg_dict(derived), "filename": derived_filename,
+                            "content_type": stored.content_type, "size_bytes": stored.size_bytes},
+            "analysis": self.analysis_dict(completed),
+            "derivation": {"status": "COMPLETED", "provenance": SOURCE_DERIVATION_PROVENANCE,
+                           "inferred_sampling_rate_hz": segment.inferred_sampling_rate_hz,
+                           "source_samples_used": segment.source_samples_used,
+                           "start_seconds": segment.start_seconds,
+                           "source_integrity_verified": True, "limitations": limitations},
+        }
+
     def _file_for_ecg(self, ecg: ECGRecord) -> ECGFile:
         # Digitized records are separate derivatives, not replacement source
         # files.  Their sole asset uses a distinct purpose so provenance stays
         # queryable without changing the existing database schema.
         file = self.session.scalar(select(ECGFile).where(
             ECGFile.ecg_uuid == ecg.ecg_uuid,
-            ECGFile.purpose.in_(("ORIGINAL", DIGITIZED_FILE_PURPOSE)),
+            ECGFile.purpose.in_(("ORIGINAL", DIGITIZED_FILE_PURPOSE, SOURCE_DERIVED_FILE_PURPOSE)),
         ).order_by(ECGFile.created_at.asc()))
         if file is None:
             raise APIError("ECG_FILE_NOT_FOUND", "The ECG waveform asset is unavailable.", 404)
@@ -1415,6 +1528,14 @@ class ClinicalService:
             AIPrediction.ai_analysis_uuid == analysis.ai_analysis_uuid
         ).order_by(AIPrediction.rank)).all()
         version = self.session.get(AIModelVersion, analysis.model_version_uuid)
+        raw_output = analysis.raw_output if isinstance(analysis.raw_output, dict) else {}
+        provenance = raw_output.get("input_provenance")
+        if not isinstance(provenance, dict):
+            provenance = None
+        safety = ("AI-generated research/clinical-decision-support output. It requires qualified clinician "
+                  "review and is not an autonomous diagnosis or treatment recommendation.")
+        if provenance and isinstance(provenance.get("limitations"), str):
+            safety = f"{safety} {provenance['limitations']}"
         return {"ai_analysis_uuid": str(analysis.ai_analysis_uuid), "ecg_uuid": str(analysis.ecg_uuid),
                 "status": analysis.status, "prediction": analysis.predicted_label,
                 "prediction_name": analysis.predicted_label_name, "confidence": analysis.confidence,
@@ -1425,8 +1546,7 @@ class ClinicalService:
                 "top_predictions": [{"rank": row.rank, "label": row.label, "label_name": row.label_name,
                                      "score": row.score} for row in predictions],
                 "has_explanation": bool(analysis.explanation_uri),
-                "safety": "AI-generated research/clinical-decision-support output. It requires qualified clinician "
-                          "review and is not an autonomous diagnosis or treatment recommendation."}
+                "input_provenance": provenance, "safety": safety}
 
     def latest_analysis(self, ecg_uuid: str) -> dict[str, Any]:
         ecg = self._ecg(ecg_uuid)
@@ -1643,6 +1763,10 @@ class ClinicalService:
         ).all() if prescription else []
         author = self.session.get(User, report.author_id)
         waveform_png = self.waveform_png(ecg)
+        raw_output = analysis.raw_output if analysis and isinstance(analysis.raw_output, dict) else {}
+        input_provenance = raw_output.get("input_provenance")
+        provenance_note = (input_provenance.get("limitations") if isinstance(input_provenance, dict)
+                           else None)
         pdf = build_ecg_report_pdf(
             hospital=organization.name if organization else "Hospital not recorded",
             patient_name=" ".join(filter(None, [patient.first_name, patient.middle_name, patient.last_name])),
@@ -1664,6 +1788,7 @@ class ClinicalService:
                 for item in items
             ],
             waveform_png=waveform_png,
+            input_provenance_note=provenance_note,
         )
         key = f"organizations/{ecg.organization_id}/reports/{report.report_uuid}/{uuid.uuid4().hex}.pdf"
         stored = self.storage.put_bytes(key, pdf, "application/pdf")
