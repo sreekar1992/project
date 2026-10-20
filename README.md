@@ -117,6 +117,8 @@ adversarial transformation, or evidence of protection against model attacks.
 
 Use a development database and private local asset directory; PostgreSQL,
 MinIO, and Redis are not required for this first local smoke test.
+To view the **deployed GKE portal** through a local port-forward instead, see
+[Open the deployed portal on your computer](localconnect.md).
 
 ```bash
 cd /Users/sreekarvarma/Documents/project
